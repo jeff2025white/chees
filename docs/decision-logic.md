@@ -1,40 +1,31 @@
 # 着法计算逻辑文档
 
-代码位置：`engine/`（board / movegen / evaluate / search / decide / explain / notation）
+代码位置：`engine/`（board / movegen / evaluate / search / book / decide / explain / notation）
+
+人机对弈界面 `ui/play.py` 也走同一 `decide_position`（`top_n=0, fill_pv=False`）。
 
 ## 1. 整体架构
 
 ### 1.1 调用链
 
 ```
-截图识别模块
+截图识别 / 对弈 FEN
   │
-  ▼  grid_str (10×9 文本) + view_side + side
+  ▼  decide_position(..., time_limit, max_depth, top_n, fill_pv)
   │
-  ▼  decide_position(grid=..., side=..., view_side=..., time_limit=4.0, max_depth=8, top_n=2)
+  ├─ mirror_grid / Board.from_fen|from_grid
+  ├─ game_status
+  ├─ lookup_book              ← 开局库命中则第 1 手用库
+  │     └─ fill_pv 时对后续局面 search 续满主变
   │
-  ├─ mirror_grid          ← 黑方在下时把 grid 翻转
-  ├─ Board.from_grid      ← 解析成 Board 对象
-  ├─ game_status          ← 开局先判断是否已死
+  ▼  search(board, time_limit, max_depth, top_n, fill_pv)   # 未命中库
   │
-  ▼  search(board, time_limit, max_depth)
+  ├─ 定长 TT（2^20）/ 杀手 / 历史启发
+  ├─ 迭代加深 + aspiration；negamax 含空着剪枝、LMR
+  ├─ top_n>0 时备选着法浅搜复核（对弈 top_n=0 跳过）
+  └─ extract_pv(fill=fill_pv)  ← fill=False 只跟 TT（对弈）
   │
-  ├─ Searcher 初始化       ← 置换表 / 杀手着法 / 历史启发
-  ├─ 迭代加深 depth=1..max_depth
-  │   └─ root_search(d)   ← 根节点全着法扫描
-  │       └─ negamax      ← Alpha-Beta 递归
-  │           ├─ 置换表查/存
-  │           ├─ is_repetition → 和棋(0)
-  │           ├─ depth<=0 → quiesce
-  │           └─ generate_legal → _order_moves → apply/undo
-  ├─ 备选着法浅搜索复核
-  └─ extract_pv            ← 从 TT 串里提取主变
-  │
-  ▼  decide_position 包装返回
-  │
-  ├─ _move_payload         ← best_move + alternatives
-  ├─ _pv_payload           ← 主变序列每步坐标 + 中文记谱 + 静态评分
-  └─ 返回 dict             ← 含 coordinate_contract、search 统计、message
+  ▼  _move_payload / _pv_payload → 返回 dict（search.book 标记是否开局库）
 ```
 
 ### 1.2 入口函数签名
@@ -44,10 +35,11 @@ decide_position(
     fen: str = None,          # FEN（与 grid 二选一）
     grid: str = None,         # 10×9 文本行（界面方向：row0=图最上）
     side=None,                # 轮到谁走："red"/"black"，缺省读 FEN
-    view_side=None,           # 图下方是谁：缺省=side
+    view_side=None,           # 图下方是谁：缺省=side；等于「我方」
     time_limit: float = 4.0,  # 总时间预算（秒）
     max_depth: int = 8,       # 最大搜索深度
-    top_n: int = 2,           # 备选着法数量
+    top_n: int = 2,           # 备选数量；<=0 跳过备选复核
+    fill_pv: bool = True,     # True=TT 断了浅层续搜（分析）；False=对弈
 ) -> dict
 ```
 
@@ -82,17 +74,21 @@ decide_position(
   },
   "search": {
     "depth": 6, "nodes": 123456, "time_ms": 3820,
-    "score_cp": 35, "mate_in": null
+    "score_cp": 35, "mate_in": null, "book": false
   },
   "message": "出动炮，抢占要道、增强进攻子力。；占据中路要点。"
 }
 ```
+
+`input` 另含 `our_side` / `view_side`（均为图下方「我方」）与 `side_to_move`。
 
 ---
 
 ## 2. 棋盘状态 Board
 
 代码位置：`engine/board.py` + `engine/constants.py`
+
+`Board` 增量维护 `piece_count` 与 `base_score`（子力+PST+深入惩罚），`apply`/`undo` 同步更新，供 `evaluate()` 使用。`is_opening()` 为 O(1)。
 
 ### 2.1 坐标与编码
 
@@ -310,15 +306,16 @@ game_status(board, color) → (status, legal_moves)
 - **红方视角**：`evaluate(board) → int`，正数 = 红方占优，单位厘兵
 - **指定方视角**：`evaluate_for(board, color)`，非红方时取负
 - 搜索中 `turn` 是 BLACK 时把 `stand = -evaluate(board)`
+- **增量**：`Board.base_score` = 子力 + PST + 深入惩罚；`evaluate` 在其上单次扫盘补算出子 / 将帅安全 / 车炮控线
 
-**评估公式**：
+**子力+PST 公式**：
 
 ```python
-红方棋子 sq 处：+ PIECE_VALUE[ptype] + PST_FLAT[ptype][sq]
-黑方棋子 sq 处：- PIECE_VALUE[ptype] - PST_FLAT[ptype][mirror[sq]]
+红方棋子 sq 处：+ PIECE_VALUE[ptype] + PST_FLAT[ptype][sq] + deep(piece,sq)
+黑方棋子 sq 处：- PIECE_VALUE[ptype] - PST_FLAT[ptype][mirror[sq]] + deep(piece,sq)
 ```
 
-`mirror[sq]` = `(9 - r) * 9 + c`，即把黑方上下翻转后复用红方位置表。
+`mirror[sq]` = `(9 - r) * 9 + c`，黑方上下翻转后复用红方位置表。另有开局出子、控线、将帅安全项。
 
 ### 4.2 位置表设计原则
 
@@ -386,124 +383,56 @@ MIRROR   = [(9 - r) * 9 + c for r in range(10) for c in range(9)]
 ### 5.1 总体框架
 
 ```
-search(board, time_limit=4.0, max_depth=8)
+search(board, time_limit=4.0, max_depth=8, top_n=2, fill_pv=True)
   │
   ├─ for depth in range(1, max_depth+1):   ← 迭代加深
   │   ├─ 预估耗时（上一层 × 3），超出预算就停
-  │   ├─ root_search(d)                    ← 根节点全着法搜索
+  │   ├─ depth≥3 时 aspiration 窗口；失败则加宽重搜
+  │   ├─ root_search(d)
   │   ├─ 杀棋则提前 break
-  │   └─ TimeUp 异常捕获 → break
+  │   └─ TimeUp → break
   │
-  ├─ 备选着法浅搜索（完整窗口复核前 4 个）
-  ├─ extract_pv(best_move)                ← 从 TT 串里提取主变
-  └─ SearchOutcome(best_move, score, depth, nodes, time_ms, ranked, pv)
+  ├─ top_n>0：备选浅搜复核（完整窗口）；top_n<=0 跳过
+  ├─ 软偏好（仅 top_n>0 且备选 exact）：吃子与布局分差极小时优先布局
+  ├─ extract_pv(best, fill=fill_pv)
+  └─ SearchOutcome(...)
 ```
 
 ### 5.2 Negamax 主搜索
 
 ```python
-negamax(depth, alpha, beta, ply):
-  1) 重复局面 → return 0（简化为和棋）
-  2) depth <= 0 → quiesce(alpha, beta, ply, 0)
-  3) 查置换表：
-     - 若 TT_EXACT 且 e_depth >= depth → return e_score
-     - 若 TT_LOWER 且 e_score > alpha → alpha = e_score
-     - 若 TT_UPPER 且 e_score < beta  → beta  = e_score
-     - alpha >= beta → return e_score
-  4) generate_legal → _order_moves(moves, ply, tt_move)
-  5) 无合法着法 → return -MATE + ply（被将死/困毙均判负）
-  6) for mv in moves:
-       apply(mv)
-       score = -negamax(depth-1, -beta, -alpha, ply+1)
-       undo()
-       更新 best / alpha / beta
-       若 alpha >= beta：更新杀手着法 + 历史启发，break
-  7) 按 alpha/beta 边界定 TT flag：
-     best <= alpha_orig → TT_UPPER（上界）
-     best >= beta       → TT_LOWER（下界）
-     其余               → TT_EXACT
-  8) store TT[key] = (depth, best, flag, best_move)
-  return best
+negamax(depth, alpha, beta, ply, allow_null=True):
+  1) 重复局面 → 0
+  2) depth <= 0 → quiesce(...)
+  3) 定长 TT probe（depth-prefer 存储）
+  4) 空着剪枝：未将军且 depth≥3 时 R=2/3，失败高则截断
+  5) generate_legal → _order_moves
+  6) LMR：靠后安静着法先减层，失败高则完整重搜
+  7) 存 TT flag（EXACT / LOWER / UPPER）
 ```
 
-**Negamax 交替**：`score = -negamax(depth-1, -beta, -alpha)`，双方都最大化自己的分数，天然对称。
+**Negamax 交替**：`score = -negamax(depth-1, -beta, -alpha)`。
 
 ### 5.3 静态搜索 quiesce
 
-消除**水平线效应**（搜索边界上的吃子导致评估失真）：
+消除水平线效应。`qdepth` 上限与 `max_depth` 挂钩：正常 ≤ `max_depth+2`，被将军 ≤ `max_depth+4`。
 
-```python
-quiesce(alpha, beta, ply, qdepth):
-  stand = evaluate(board)      # 红方视角
-  if turn == BLACK: stand = -stand
-
-  checked = in_check(board, turn)
-
-  if not checked:
-    if qdepth >= 6: return stand          # 未被将军，最多搜 6 层静态
-    if stand >= beta: return stand        # 截断
-    if stand > alpha: alpha = stand
-    moves = generate_captures(...)        # 只搜吃子
-  else:
-    if qdepth >= 12: return stand         # 被将军，最多搜 12 层
-    moves = generate_legal(...)           # 搜全部应着
-    if not moves: return -MATE + ply      # 将死
-
-  moves = _order_moves(moves, ply)
-  for mv in moves:
-    if not checked:
-      # 差值剪枝：白吃价值也不足以提高 alpha
-      victim = board.cells[mv[1]]
-      if victim and stand + PIECE_VALUE[victim] + 200 < alpha:
-        continue
-    apply(mv)
-    score = -quiesce(-beta, -alpha, ply+1, qdepth+1)
-    undo()
-    if score >= beta: return score
-    if score > alpha: alpha = score
-  return alpha
-```
-
-**关键剪枝**：被将军时不能只搜吃子（可能存在不吃子的解将着法），必须搜全部合法着法。
+- 未将军：只搜吃子；`stand + PIECE_VALUE[victim] + 200 < alpha` 差值剪枝
+- 被将军：搜全部合法应着（不可只搜吃子）
 
 ### 5.4 置换表
 
-```python
-TT[key] = (e_depth, e_score, e_flag, e_move)
-e_flag ∈ {TT_EXACT=0, TT_LOWER=1, TT_UPPER=2}
-```
+模块级定长数组，`TT_SIZE = 2^20`，下标 `key & (TT_SIZE-1)`，存完整 key 防误命中；**depth-prefer** 替换。
 
-**命中条件**：`e_depth >= depth` 且边界区间相交。
-
-**三种 flag 含义**：
-
-| flag | 条件 | 解释 |
-|------|------|------|
-| TT_EXACT | `best` 在 `(alpha_orig, beta)` 之间 | 精确值 |
-| TT_LOWER | `best >= beta`（抬高了 alpha） | 真实值至少是 best |
-| TT_UPPER | `best <= alpha_orig`（没抬高 alpha） | 真实值至多是 best |
-
-TT 着法在 `_order_moves` 里排第一，给 `10^7` 的排序分。
+`e_flag ∈ {TT_EXACT, TT_LOWER, TT_UPPER}`，含义同标准 alpha-beta TT。
 
 ### 5.5 着法排序
 
-```python
-_order_moves(moves, ply, tt_move):
-  for mv in moves:
-    victim = cells[mv[1]]
-    if mv == tt_move:           score = 10_000_000
-    elif victim:                score = 100_000 + PIECE_VALUE[victim]*10 - PIECE_VALUE[attacker]
-    elif mv == killers[0]:      score = 90_000
-    elif mv == killers[1]:      score = 89_000
-    else:                       score = history.get(mv, 0)   # depth² 累加
-  sorted → 降序
-```
+优先级：TT 着法 > MVV-LVA（+ 轻微 SEE 微调）吃子 > 杀手 > 历史启发。
 
-**排序优先级**：TT 着法 > MVV-LVA 吃子 > 杀手着法 0 > 杀手着法 1 > 历史启发
+开局时进攻子深入对方底线的吃子会降级，避免乱吃。
 
-**杀手着法**（Killer Heuristic）：每层记录**两个**引起 beta 截断的着法（只记非吃子着法），新入的挤掉旧的。
-
-**历史启发**（History Heuristic）：对弈分支节点的着法，`history[mv] += depth²`。
+**杀手 / 历史**：beta 截断的非吃子写入杀手；`history[mv] += depth²`。
 
 ### 5.6 迭代加深与时间控制
 
@@ -710,8 +639,8 @@ pixel_y = margin_y + row * cell_h
 | 2 | 搜索深度无 futility pruning | 残局浅搜时仍会走一些明显没用的着法 | 时间限制 4 秒 + 迭代加深 6-8 层基本够用 |
 | 3 | PST 表单一，无开局/中局/残局切换 | 开局时马在底线和活跃区只有 ±26 差异 | 开局主要靠子力价值主导，PST 只是微调 |
 | 4 | 静态搜索差值剪枝固定 +200 | 子力差接近边界时可能剪掉重要着法 | 实际测试中很少触发 |
-| 5 | 主变提取依赖 TT 链 | 若某节点的 TT 条目缺失 → PV 断链 | `extract_pv` 有 max_len 兜底，断链就停 |
-| 6 | 着法排序无 SEE（静态交换评估） | 复杂吃子序列的排序可能不准 | MVV-LVA + 历史启发在大多数场景足够 |
+| 5 | 主变提取依赖 TT 链 | TT 断链则 PV 缩短 | 分析页 `fill_pv=True` 可浅层续搜；对弈 `fill_pv=False` 只跟 TT |
+| 6 | SEE 仅为粗近似 | 复杂交换排序不准 | 排序以 MVV-LVA 为主，SEE 只作微调 |
 
 ---
 
@@ -729,6 +658,8 @@ PIECE_VALUE = {KING:60000, CHARIOT:900, CANNON:450, HORSE:400, ADVISOR:200, ELEP
 MATE = 100000
 INF  = 10_000_000
 MAX_PLY = 64
+TT_SIZE = 1 << 20
+ASPIRATION = 60
 ```
 
 ---
@@ -736,16 +667,15 @@ MAX_PLY = 64
 ## 11. 模块依赖图
 
 ```
-constants.py        ← 所有模块依赖
+constants.py
     ↑
-board.py            ← movegen / evaluate / decide 依赖
+board.py  ←→ evaluate.py（增量 base_score / piece_base_term）
     ↑
-movegen.py           ← search / decide 依赖（generate_legal, in_check, game_status）
-evaluate.py          ← search 依赖（evaluate）
-notation.py          ← decide 依赖（chinese_notation, move_to_iccs, move_to_ucci）
-explain.py           ← decide 依赖（analyze_move, build_reason）
+movegen.py / book.py / notation.py / explain.py
     ↑
-search.py            ← decide 依赖（search 函数, MATE 常量）
+search.py
     ↑
-decide.py            ← 顶层入口，对外暴露 decide_position
+decide.py   ← 顶层入口 decide_position
+    ↑
+ui/app.py（截图分析）  ui/play.py（人机对弈）
 ```
