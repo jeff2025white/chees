@@ -116,30 +116,12 @@ def build_reason(facts: dict) -> tuple:
             clauses.append("形成将军，逼迫对方应付" if not facts["captured"] else "并同时将军")
             tags.append("check")
 
+        # 无明确战术时不编布局套话（“出动马，抢占要道”等不准确）
         if not clauses:
-            ptype = facts["ptype"]
-            name = piece_name(facts["piece"])
-            if ptype == PAWN:
-                if facts["crossed_river"]:
-                    clauses.append("兵过河，活动范围变大并逼近对方九宫")
-                else:
-                    clauses.append("推进兵线，为后续进攻做准备")
-            elif ptype in (CHARIOT, CANNON, HORSE):
-                clauses.append(f"出动{name}，抢占要道、增强进攻子力")
-            elif ptype in (ADVISOR, ELEPHANT):
-                clauses.append(f"补上{name}，稳固防守")
-                tags.append("defense")
-            elif ptype == KING:
-                clauses.append("调整帅位，避开潜在威胁")
-                tags.append("defense")
-            else:
-                clauses.append(f"调动{name}，改善子力位置")
-            if facts["to_col"] in (3, 4, 5) and ptype not in (ADVISOR, ELEPHANT):
-                clauses.append("占据中路要点")
-            tags.append("development")
+            tags.append("quiet")
 
-    # 落点安全性
-    if facts["attacked_after"]:
+    # 落点安全性：仅在有其它战术条款时补充；单独一句“有保护”意义不大
+    if clauses and facts["attacked_after"]:
         if facts["defended_after"]:
             clauses.append("落点有己方子力保护")
             tags.append("supported")
@@ -147,7 +129,7 @@ def build_reason(facts: dict) -> tuple:
             clauses.append("注意落点暂无保护，可能被对方吃回")
             tags.append("risky")
 
-    # 后续威胁（只提无根的子，避免每步都说“威胁吃马”）
+    # 后续威胁（只提无根的子）
     if not facts["is_mate"] and facts["threat"] and not facts["threat_defended"]:
         name = piece_name(facts["threat"])
         clauses.append(f"下一步可白吃对方{name}")

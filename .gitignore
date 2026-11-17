@@ -9,4 +9,5 @@ build/
 venv/
 node_modules/
 *.log
+.play_session.lock
 images/annotated/*.png

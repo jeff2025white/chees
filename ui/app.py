@@ -17,6 +17,7 @@
 
 import os
 import queue
+import subprocess
 import sys
 import threading
 
@@ -38,6 +39,10 @@ BG = "#1f2430"
 PANEL = "#2b3242"
 FG = "#e6e6e6"
 ACCENT = "#e23b3b"
+BTN_BG = "#3b4459"
+BTN_HOVER = "#4b5570"
+BTN_DISABLED_BG = "#252b38"
+BTN_DISABLED_FG = "#7a8499"
 UI_FONT = ("Microsoft YaHei", 10)
 UI_FONT_B = ("Microsoft YaHei", 10, "bold")
 TITLE_FONT = ("Microsoft YaHei", 13, "bold")
@@ -45,6 +50,55 @@ TITLE_FONT = ("Microsoft YaHei", 13, "bold")
 
 # 启动窗口尺寸（物理像素）
 WINDOW_W, WINDOW_H = 1024, 768
+
+
+class FlatButton(tk.Label):
+    """自绘按钮。macOS Aqua 会忽略 tk.Button 的 bg/fg，导致浅底浅字不可读。"""
+
+    def __init__(self, parent, text, command=None, **kwargs):
+        self._command = command
+        self._enabled = True
+        self._bg = kwargs.pop("bg", BTN_BG)
+        self._fg = kwargs.pop("fg", FG)
+        self._hover = kwargs.pop("activebackground", BTN_HOVER)
+        kwargs.setdefault("cursor", "hand2")
+        super().__init__(parent, text=text, bg=self._bg, fg=self._fg, **kwargs)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+
+    def _on_enter(self, _event=None):
+        if self._enabled:
+            super().configure(bg=self._hover)
+
+    def _on_leave(self, _event=None):
+        super().configure(bg=self._bg if self._enabled else BTN_DISABLED_BG)
+
+    def _on_click(self, _event=None):
+        if self._enabled and self._command:
+            self._command()
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            kwargs = {**cnf, **kwargs}
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "state" in kwargs:
+            state = kwargs.pop("state")
+            self._enabled = str(state) not in ("disabled", str(tk.DISABLED))
+            if self._enabled:
+                kwargs.setdefault("bg", self._bg)
+                kwargs.setdefault("fg", self._fg)
+                kwargs.setdefault("cursor", "hand2")
+            else:
+                kwargs.setdefault("bg", BTN_DISABLED_BG)
+                kwargs.setdefault("fg", BTN_DISABLED_FG)
+                kwargs.setdefault("cursor", "arrow")
+        if kwargs:
+            return super().configure(**kwargs)
+        return None
+
+    config = configure
 
 
 def _enable_dpi_awareness():
@@ -117,14 +171,12 @@ class ChessApp:
         nav = tk.Frame(left, bg=PANEL)
         nav.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
 
-        self.btn_prev = tk.Button(nav, text="◀", width=4, font=UI_FONT_B,
-                                  bg="#3b4459", fg=FG, activebackground="#4b5570",
-                                  relief="flat", command=self.prev_image)
+        self.btn_prev = FlatButton(nav, text="◀", width=4, font=UI_FONT_B,
+                                   command=self.prev_image, padx=8, pady=4)
         self.btn_prev.pack(side="left")
 
-        self.btn_next = tk.Button(nav, text="▶", width=4, font=UI_FONT_B,
-                                  bg="#3b4459", fg=FG, activebackground="#4b5570",
-                                  relief="flat", command=self.next_image)
+        self.btn_next = FlatButton(nav, text="▶", width=4, font=UI_FONT_B,
+                                   command=self.next_image, padx=8, pady=4)
         self.btn_next.pack(side="right")
 
         self.lbl_file = tk.Label(nav, text="未加载图片", bg=PANEL, fg=FG,
@@ -139,6 +191,15 @@ class ChessApp:
         tk.Label(right, text="中国象棋助手", bg=PANEL, fg=FG,
                  font=TITLE_FONT).pack(pady=(16, 14), padx=16, anchor="w")
 
+        # 底栏链接先 pack，保证贴在右侧面板底部
+        footer = tk.Frame(right, bg=PANEL)
+        footer.pack(side="bottom", fill="x", padx=16, pady=(8, 16))
+        self.btn_play = FlatButton(
+            footer, text="人机对弈 →", font=UI_FONT_B, command=self.open_play,
+            activebackground=ACCENT, padx=8, pady=12,
+        )
+        self.btn_play.pack(fill="x")
+
         self.btn_open = self._mk_button(right, "打开图片", self.open_image)
         self.btn_shot = self._mk_button(right, "截图（暂未实现）", self.not_implemented)
         self.btn_shot.configure(state="disabled")
@@ -147,11 +208,11 @@ class ChessApp:
         # 迭代深度拉杆
         depth_box = tk.Frame(right, bg=PANEL)
         depth_box.pack(fill="x", padx=16, pady=(6, 0))
-        self.lbl_depth = tk.Label(depth_box, text="迭代深度：5 层", bg=PANEL, fg=FG,
+        self.lbl_depth = tk.Label(depth_box, text="迭代深度：6 层", bg=PANEL, fg=FG,
                                   font=UI_FONT, anchor="w")
         self.lbl_depth.pack(fill="x")
 
-        self.depth_var = tk.IntVar(value=5)
+        self.depth_var = tk.IntVar(value=6)
         self.depth_var.trace_add("write", self._on_depth_change)
         self.scale_depth = tk.Scale(
             depth_box, from_=2, to=12, orient="horizontal", variable=self.depth_var,
@@ -187,9 +248,8 @@ class ChessApp:
                                "（方向键左右也可切换）")])
 
     def _mk_button(self, parent, text, cmd):
-        btn = tk.Button(parent, text=text, font=UI_FONT_B, bg="#3b4459", fg=FG,
-                        activebackground=ACCENT, activeforeground="#ffffff",
-                        relief="flat", height=2, cursor="hand2", command=cmd)
+        btn = FlatButton(parent, text=text, font=UI_FONT_B, command=cmd,
+                         activebackground=ACCENT, padx=8, pady=12)
         btn.pack(fill="x", padx=16, pady=4)
         return btn
 
@@ -253,6 +313,18 @@ class ChessApp:
     def not_implemented(self):
         messagebox.showinfo("提示", "截图功能暂未实现。")
 
+    def open_play(self):
+        """另开人机对弈窗口（与本窗并存）。"""
+        script = os.path.join(_HERE, "play.py")
+        try:
+            subprocess.Popen(
+                [sys.executable, script],
+                cwd=_ROOT,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            messagebox.showerror("无法启动", str(exc))
+
     def _on_depth_change(self, *_args):
         self.lbl_depth.configure(text=f"迭代深度：{self.depth_var.get()} 层")
 
@@ -277,7 +349,13 @@ class ChessApp:
             return
         self._busy = True
         self.btn_calc.configure(state="disabled", text="计算中…")
-        self._write_info([("head", "分析中\n"), ("", "正在识别棋盘并搜索最佳着法…")])
+        name = os.path.basename(self.current_path)
+        self._write_info([
+            ("head", "分析中\n"),
+            ("", f"图片：{name}\n"),
+            ("", f"迭代深度：{self.depth_var.get()} 层\n"),
+            ("", "正在识别棋盘并搜索最佳着法…\n"),
+        ])
         path = self.current_path
         depth = self.depth_var.get()
         threading.Thread(target=self._calc_worker, args=(path, depth), daemon=True).start()
@@ -296,7 +374,7 @@ class ChessApp:
             time_limit = min(90.0, max(4.0, 2.5 * (3 ** (max_depth - 4))))
             decision = decide_position(
                 grid=analysis.grid_str,
-                # 我方是棋盘下半边一方，即为它计算着法
+                # 第一步固定为我方：图下方先走（与红黑无关）
                 side=analysis.view_side,
                 view_side=analysis.view_side,
                 time_limit=time_limit,
@@ -323,8 +401,13 @@ class ChessApp:
         self._busy = False
         self.btn_calc.configure(state="normal", text="计算")
 
+        img_name = os.path.basename(self.current_path or "")
         if error is not None:
-            self._write_info([("warn", "计算失败\n"), ("", str(error))])
+            self._write_info([
+                ("warn", "计算失败\n"),
+                ("", f"图片：{img_name}\n"),
+                ("", str(error)),
+            ])
             messagebox.showerror("计算失败", str(error))
             return
 
@@ -333,15 +416,21 @@ class ChessApp:
         self.base_image = pil
         self._render()
 
+        # 我方 = 棋盘下半部（view_side），不能按红/黑或行棋方判断
         side_txt = "红方在下" if analysis.red_bottom else "黑方在下"
         search_info = decision.get("search") or {}
         pv = decision.get("pv") or {}
-        our_side = (decision.get("input") or {}).get("our_side", "red")
+        inp = decision.get("input") or {}
+        our_side = inp.get("view_side") or inp.get("our_side") or analysis.view_side
+        turn = inp.get("side_to_move", "red")
+        turn_txt = "红方行棋" if turn == "red" else "黑方行棋"
 
         lines = [
+            ("head", "当前图片\n"),
+            ("", f"{img_name}\n\n"),
             ("head", "识别结果\n"),
-            ("", f"红{analysis.red_count}/黑{analysis.black_count} · {side_txt}"
-                 f" · 命中{analysis.hit}\n\n"),
+            ("", f"红{analysis.red_count}/黑{analysis.black_count} · {side_txt}（我方）"
+                 f" · {turn_txt} · 命中{analysis.hit}\n\n"),
             ("head", "推演序列\n"),
         ]
 
@@ -357,12 +446,16 @@ class ChessApp:
                     tag = "move" if who == "我方" else "opp"
                     lines.append((tag, f"{i + 1:>2}.{name} {who} {score:+.2f}\n"))
             else:
-                lines.append(("move", f"{best['chinese']}  {best['iccs']}\n"))
+                who = "我方" if best.get("color") == our_side else "对方"
+                tag = "move" if who == "我方" else "opp"
+                lines.append((tag, f"{best['chinese']}  {who}  {best['iccs']}\n"))
 
             lines.append(("", f"\n最终评价 {best['score_text']}"
                               f"{'  · 将军' if best.get('gives_check') else ''}"
                               f"{'  · 绝杀' if best.get('is_mate') else ''}\n"))
-            lines.append(("", f"深度 {search_info.get('depth', 0)} 层"
+            src = "开局库+" if search_info.get("book") else ""
+            lines.append(("", f"{src}深度 {search_info.get('depth', 0)} 层"
+                              f" · 推演 {len(pv.get('chinese') or [])} 步"
                               f" · {search_info.get('nodes', 0):,} 节点"
                               f" · {search_info.get('time_ms', 0) / 1000:.1f}s\n"))
             if best.get("reason"):
@@ -381,6 +474,14 @@ class ChessApp:
 
 
 def main():
+    # 人机对弈进行中时不要抢焦点弹出截图分析窗；
+    # 对弈页「截图分析」按钮会带 CHEES_ALLOW_WITH_PLAY=1 显式放行。
+    play_lock = os.path.join(_ROOT, ".play_session.lock")
+    allow = os.environ.get("CHEES_ALLOW_WITH_PLAY") == "1"
+    if os.path.isfile(play_lock) and not allow:
+        print("人机对弈进行中，跳过启动截图分析界面。")
+        return
+
     _enable_dpi_awareness()
     root = tk.Tk()
     app = ChessApp(root)

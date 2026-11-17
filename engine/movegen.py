@@ -39,6 +39,24 @@ ELEPHANT_MOVES = (
     (2, -2, 1, -1), (2, 2, 1, 1),
 )
 
+# 预计算：每格马/象候选 (to_sq, blocker_sq)，避免热路径重复边界运算
+HORSE_DEST = [[] for _ in range(SQUARES)]
+ELEPHANT_DEST = [[] for _ in range(SQUARES)]
+for _sq in range(SQUARES):
+    _r, _c = divmod(_sq, COLS)
+    for _dr, _dc, _lr, _lc in HORSE_MOVES:
+        _nr, _nc = _r + _dr, _c + _dc
+        if 0 <= _nr < ROWS and 0 <= _nc < COLS:
+            HORSE_DEST[_sq].append(
+                (_nr * COLS + _nc, (_r + _lr) * COLS + (_c + _lc))
+            )
+    for _dr, _dc, _er, _ec in ELEPHANT_MOVES:
+        _nr, _nc = _r + _dr, _c + _dc
+        if 0 <= _nr < ROWS and 0 <= _nc < COLS:
+            ELEPHANT_DEST[_sq].append(
+                (_nr * COLS + _nc, (_r + _er) * COLS + (_c + _ec), _nr)
+            )
+
 
 def _is_own(piece: int, color: int) -> bool:
     return piece != EMPTY and (piece >> 3) == color
@@ -94,33 +112,23 @@ def generate_pseudo_moves(board, color: int):
                         add((frm, to))
 
         elif ptype == ELEPHANT:
-            for dr, dc, er, ec in ELEPHANT_MOVES:
-                nr, nc = r + dr, c + dc
-                if nr < 0 or nr >= ROWS or nc < 0 or nc >= COLS:
-                    continue
+            for to, eye, nr in ELEPHANT_DEST[frm]:
                 # 象不能过河
                 if is_red:
                     if nr < 5:
                         continue
                 elif nr > 4:
                     continue
-                # 塞象眼
-                if cells[(r + er) * COLS + (c + ec)] != EMPTY:
+                if cells[eye] != EMPTY:
                     continue
-                to = nr * COLS + nc
                 t = cells[to]
                 if t == EMPTY or (t >> 3) == enemy:
                     add((frm, to))
 
         elif ptype == HORSE:
-            for dr, dc, lr, lc in HORSE_MOVES:
-                nr, nc = r + dr, c + dc
-                if nr < 0 or nr >= ROWS or nc < 0 or nc >= COLS:
+            for to, leg in HORSE_DEST[frm]:
+                if cells[leg] != EMPTY:
                     continue
-                # 蹩马腿：马腿在长边方向的相邻格
-                if cells[(r + lr) * COLS + (c + lc)] != EMPTY:
-                    continue
-                to = nr * COLS + nc
                 t = cells[to]
                 if t == EMPTY or (t >> 3) == enemy:
                     add((frm, to))

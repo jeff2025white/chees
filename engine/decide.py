@@ -6,7 +6,8 @@
 """
 
 from .board import Board
-from .constants import BLACK, COLS, RED
+from .book import book_entries, lookup_book
+from .constants import BLACK, COLS, RED, START_FEN
 from .explain import analyze_move, build_reason
 from .evaluate import evaluate_for
 from .movegen import game_status, generate_legal, in_check
@@ -17,9 +18,20 @@ from .notation import (
     piece_name,
     sq_to_iccs,
 )
-from .search import MATE, search
+from .search import MATE, SearchOutcome, search
 
 SIDE_NAMES = {RED: "red", BLACK: "black"}
+
+
+def is_start_position(board) -> bool:
+    """是否为标准开局（双方 16 子、将帅原位、棋子布局与 START_FEN 一致）。"""
+    start = Board.from_fen(START_FEN)
+    return board.cells == start.cells
+
+
+def infer_side_to_move(board, fallback: int = RED) -> int:
+    """截图路径的行棋方：固定为我方（图下方）先走，与红黑无关。"""
+    return fallback
 
 
 def parse_side(value):
@@ -112,11 +124,10 @@ def _move_payload(board, move, score: int, view_side: int, exact: bool = True,
 def _pv_payload(board, pv, view_side) -> dict:
     """主变序列 -> ICCS、中文记谱、走子方、每步后的静态评分与界面坐标。
 
-    scores 与 chinese 等长，为“走完该步后”的静态评分（我方视角，厘兵）。
-    steps 为每步的起止格子（行/列），已按 view_side 转为图像方向。
+    scores 为走完该步后、以我方（view_side=图下方）视角的静态评分。
+    steps 已按 view_side 转为图像方向。
     """
     replay = board.clone()
-    our_side = board.turn
     iccs, chinese, sides, scores, steps = [], [], [], [], []
     for move in pv:
         if move not in generate_legal(replay, replay.turn):
@@ -132,7 +143,7 @@ def _pv_payload(board, pv, view_side) -> dict:
         chinese.append(chinese_notation(replay, move))
         sides.append(SIDE_NAMES[replay.turn])
         replay.apply(move)
-        scores.append(evaluate_for(replay, our_side))
+        scores.append(evaluate_for(replay, view_side))
     return {"iccs": iccs, "chinese": chinese, "sides": sides,
             "scores": scores, "steps": steps}
 
@@ -145,6 +156,7 @@ def decide_position(
     time_limit: float = 4.0,
     max_depth: int = 8,
     top_n: int = 2,
+    fill_pv: bool = True,
 ) -> dict:
     """核心决策函数。
 
@@ -155,37 +167,53 @@ def decide_position(
         view_side  哪一方在图下方（决定输出坐标方向），缺省等于行棋方
         time_limit 搜索时间预算（秒）
         max_depth  最大搜索深度
-        top_n      备选着法数量
+        top_n      备选着法数量；<=0 时跳过备选复核以加速
+        fill_pv    True=置换表断开时浅层续搜补满主变（分析页）；
+                   False=只跟 TT（对弈页）
 
     返回：见 outputs/design.md 的“契约”一节。
     """
     side = parse_side(side)
     view_side = parse_side(view_side) if view_side is not None else None
-    if view_side is None:
-        view_side = side if side is not None else RED
     if fen:
         board = Board.from_fen(fen)
     elif grid:
         # 约定：grid 是“界面方向”（第 0 行 = 图最上方）。
-        # 图下方是我方；若我方执黑，内部棋盘方向与图像相反，需镜像。
-        board = Board.from_grid(mirror_grid(grid) if view_side == BLACK else grid,
-                                side if side is not None else RED)
+        # view_side = 图下方一方；若其执黑，内部棋盘与图像相反，需镜像。
+        orient = view_side if view_side is not None else (
+            side if side is not None else RED)
+        board = Board.from_grid(
+            mirror_grid(grid) if orient == BLACK else grid,
+            RED,
+        )
     else:
         raise ValueError("必须提供 fen 或 grid")
+
+    if view_side is None:
+        view_side = side if side is not None else RED
+
     if side is not None:
         board.turn = side
-    our_side = board.turn
+    elif fen is None:
+        # 截图路径：第一步固定为我方（图下方）先走
+        board.turn = infer_side_to_move(board, fallback=view_side)
+    # fen 且 side=None：保留 FEN 自带行棋方
 
-    status, legal = game_status(board, our_side)
+    # 契约：our_side / view_side = 图下方（我方）；
+    # 截图分析时 side_to_move 与我方相同（我方先走）。
+    to_move = board.turn
+    our_side = view_side
+
+    status, legal = game_status(board, to_move)
     base = {
         "ok": True,
         "input": {
             "fen": board.to_fen(),
             "grid": board.to_grid(),
-            "side_to_move": SIDE_NAMES[our_side],
+            "side_to_move": SIDE_NAMES[to_move],
             "our_side": SIDE_NAMES[our_side],
             "view_side": SIDE_NAMES[view_side],
-            "in_check": in_check(board, our_side),
+            "in_check": in_check(board, to_move),
             "legal_move_count": len(legal),
         },
         "coordinate_contract": {
@@ -201,22 +229,82 @@ def decide_position(
     }
 
     if not legal:
+        mover = "我方" if to_move == our_side else "对方"
         if status == "checkmate":
-            message = "我方已被将死，无合法着法。"
+            message = f"{mover}已被将死，无合法着法。"
         else:
-            message = "我方被困毙（无合法着法且未被将军），按规则判负。"
+            message = f"{mover}被困毙（无合法着法且未被将军），按规则判负。"
         base.update({
             "best_move": None,
             "alternatives": [],
             "pv": {"iccs": [], "chinese": [], "sides": [], "scores": [], "steps": []},
-            "search": {"depth": 0, "nodes": 0, "time_ms": 0},
+            "search": {"depth": 0, "nodes": 0, "time_ms": 0, "book": False},
             "message": message,
         })
         return base
 
-    outcome = search(board, time_limit=time_limit, max_depth=max_depth)
+    # 开局库优先：第 1 手用库，其后按迭代深度继续搜索，凑满推演序列
+    book_hit = lookup_book(board, legal)
+    if book_hit is not None:
+        move, weight, _iccs = book_hit
+        replay = board.clone()
+        replay.apply(move)
+        static = evaluate_for(replay, to_move)
+        ranked = [(move, static, True)]
+        for alt_move, alt_w, _alt_iccs in book_entries(board):
+            if alt_move == move or alt_move not in legal:
+                continue
+            scratch = board.clone()
+            scratch.apply(alt_move)
+            alt_score = evaluate_for(scratch, to_move) - max(0, (weight - alt_w))
+            ranked.append((alt_move, alt_score, True))
+
+        pv = [move]
+        nodes = 0
+        elapsed_ms = 0
+        depth = 1
+        score = static
+        cont_depth = max(0, max_depth - 1)
+        if cont_depth > 0 and fill_pv:
+            cont = search(replay, time_limit=time_limit, max_depth=cont_depth,
+                          top_n=top_n, fill_pv=True)
+            if cont.pv:
+                pv.extend(cont.pv)
+            elif cont.best_move:
+                pv.append(cont.best_move)
+            nodes = cont.nodes
+            elapsed_ms = cont.elapsed_ms
+            depth = 1 + max(cont.depth, len(cont.pv))
+            # 续搜分从对方视角，取反为我方（行棋方）分
+            score = -cont.score
+        elif cont_depth > 0 and not fill_pv:
+            # 对弈：开局库定第 1 手即可，不必为 PV 续搜
+            pass
+        # 截断到目标深度，避免过长
+        pv = pv[:max_depth]
+        depth = max(depth, len(pv))
+        outcome = SearchOutcome(
+            best_move=move,
+            score=score,
+            depth=depth,
+            nodes=nodes,
+            elapsed_ms=elapsed_ms,
+            ranked=ranked,
+            pv=pv,
+            alt_depth=0,
+        )
+        from_book = True
+    else:
+        outcome = search(board, time_limit=time_limit, max_depth=max_depth,
+                         top_n=top_n, fill_pv=fill_pv)
+        from_book = False
 
     best = _move_payload(board, outcome.best_move, outcome.score, view_side)
+    if from_book:
+        who = "我方" if to_move == our_side else "对方"
+        best["reason"] = f"开局库（{who}）：{best['chinese']}。" + (best.get("reason") or "")
+        best["tags"] = list(best.get("tags") or []) + ["book"]
+
     ranked = sorted(outcome.ranked, key=lambda item: item[1], reverse=True)
     alternatives = []
     for move, score, exact in ranked:
@@ -237,6 +325,7 @@ def decide_position(
             "time_ms": outcome.elapsed_ms,
             "score_cp": outcome.score,
             "mate_in": outcome.mate_in,
+            "book": from_book,
         },
         "message": best["reason"],
     })

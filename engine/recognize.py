@@ -602,35 +602,43 @@ def annotate(analysis, decision, draw_grid=True):
 
     best = decision.get("best_move") if decision else None
     if best:
-        pv_steps = (decision.get("pv") or {}).get("steps") or []
+        pv = decision.get("pv") or {}
+        pv_steps = pv.get("steps") or []
+        # 契约：推演第 1 手=我方、第 2 手=对方应手；两手都画在棋盘上
         rad = int(cell * 0.45)
         half = int(cell * 0.46)
 
-        # 先画对方应手（绿色线 + 绿色起点框 + 黄色终点框），我方着法覆盖其上
+        def _step_coords(step):
+            fx, fy = a.cell_center(step["from"]["row"], step["from"]["col"])
+            tx, ty = a.cell_center(step["to"]["row"], step["to"]["col"])
+            return int(fx), int(fy), int(tx), int(ty)
+
+        # 先画第 2 手（对方）：绿线 + 绿框起点 + 黄框终点
         if len(pv_steps) >= 2:
-            s = pv_steps[1]
-            rfx, rfy = a.cell_center(s["from"]["row"], s["from"]["col"])
-            rtx, rty = a.cell_center(s["to"]["row"], s["to"]["col"])
-            rfx, rfy, rtx, rty = int(rfx), int(rfy), int(rtx), int(rty)
+            rfx, rfy, rtx, rty = _step_coords(pv_steps[1])
             cv2.line(vis, (rfx, rfy), (rtx, rty), (0, 200, 0), 3)
             cv2.rectangle(vis, (rfx - half, rfy - half), (rfx + half, rfy + half),
                           (0, 200, 0), 4)
             cv2.rectangle(vis, (rtx - half, rty - half), (rtx + half, rty + half),
                           (0, 255, 255), 4)
 
-        fc, fr = best["from"]["col"], best["from"]["row"]
-        tc, tr = best["to"]["col"], best["to"]["row"]
-        fx, fy = a.cell_center(fr, fc)
-        tx, ty = a.cell_center(tr, tc)
-        fx, fy, tx, ty = int(fx), int(fy), int(tx), int(ty)
-
+        # 再画第 1 手（我方）：红线 + 红圈起点 + 蓝圈终点（盖在上层）
+        if pv_steps:
+            our = pv_steps[0]
+        else:
+            our = {
+                "from": {"row": best["from"]["row"], "col": best["from"]["col"]},
+                "to": {"row": best["to"]["row"], "col": best["to"]["col"]},
+            }
+        fx, fy, tx, ty = _step_coords(our)
         cv2.line(vis, (fx, fy), (tx, ty), (0, 0, 255), 3)
         cv2.circle(vis, (fx, fy), rad + 7, (0, 0, 255), 5)
         cv2.circle(vis, (fx, fy), rad + 1, (255, 255, 255), 2)
-        # 终点用蓝色描边空心圆（BGR）
         cv2.circle(vis, (tx, ty), rad + 5, (255, 0, 0), 5)
 
         label = f"{best['chinese']} ({best['iccs']})  {best['score_text']}"
+        if len(pv.get("chinese") or []) >= 2:
+            label = f"{pv['chinese'][0]} / {pv['chinese'][1]}  {best['score_text']}"
         reason = best.get("reason", "")
         if reason:
             reason = reason[:70]

@@ -13,6 +13,7 @@ from .constants import (
     SQUARES,
     color_of,
 )
+from .evaluate import compute_base_score, is_opening_cells, piece_base_term
 
 # ---------------------------------------------------------------------------
 # Zobrist 随机表：固定种子，保证可复现
@@ -49,9 +50,11 @@ class Board:
     cells 为长度 90 的一维数组；turn 表示轮到哪一方走（RED / BLACK）。
     undo_stack 保存 (move, captured, hash_before) 供撤销；
     hash_stack 保存每一步之后的 Zobrist 哈希，用于重复局面判断。
+    piece_count / base_score 随走子增量维护，供评估加速。
     """
 
-    __slots__ = ("cells", "turn", "undo_stack", "hash_stack", "kings")
+    __slots__ = ("cells", "turn", "undo_stack", "hash_stack", "kings",
+                 "piece_count", "base_score")
 
     def __init__(self, cells=None, turn: int = RED):
         self.cells = list(cells) if cells is not None else [EMPTY] * SQUARES
@@ -60,15 +63,23 @@ class Board:
         self.hash_stack = [self._compute_hash()]
         # 缓存双方将/帅位置，搜索中 O(1) 取用；-1 表示不在棋盘上
         self.kings = [-1, -1]
+        self.piece_count = 0
         for sq, piece in enumerate(self.cells):
-            if (piece & 7) == 1:
-                self.kings[piece >> 3] = sq
+            if piece:
+                self.piece_count += 1
+                if (piece & 7) == 1:
+                    self.kings[piece >> 3] = sq
+        self.base_score = compute_base_score(self.cells)
 
     # -- 基础访问 ---------------------------------------------------------
     @property
     def hash(self) -> int:
         """当前局面的 Zobrist 哈希。"""
         return self.hash_stack[-1]
+
+    def is_opening(self) -> bool:
+        """开局阶段（将帅原位且子力仍多）。"""
+        return is_opening_cells(self.cells, self.piece_count)
 
     def piece_at(self, col: int, row: int) -> int:
         """按列、行取棋子（越界返回 EMPTY）。"""
@@ -102,7 +113,11 @@ class Board:
         h = self.hash_stack[-1] ^ ZOBRIST[piece][frm] ^ ZOBRIST[piece][to]
         if captured:
             h ^= ZOBRIST[captured][to]
+            self.base_score -= piece_base_term(captured, to)
+            self.piece_count -= 1
         h ^= _ZOBRIST_SIDE
+        self.base_score -= piece_base_term(piece, frm)
+        self.base_score += piece_base_term(piece, to)
         cells[frm] = EMPTY
         cells[to] = piece
         if (piece & 7) == 1:
@@ -112,17 +127,33 @@ class Board:
         self.hash_stack.append(h)
         return captured
 
+    def apply_null(self) -> None:
+        """空着（只换行棋方），供空着剪枝使用。"""
+        h = self.hash_stack[-1] ^ _ZOBRIST_SIDE
+        self.turn = BLACK if self.turn == RED else RED
+        self.undo_stack.append((None, 0, h))
+        self.hash_stack.append(h)
+
     def undo(self) -> None:
-        """撤销最近一步。"""
+        """撤销最近一步（含空着）。"""
         move, captured, _ = self.undo_stack.pop()
+        self.hash_stack.pop()
+        if move is None:
+            self.turn = BLACK if self.turn == RED else RED
+            return
         frm, to = move
         cells = self.cells
-        cells[frm] = cells[to]
+        piece = cells[to]
+        self.base_score -= piece_base_term(piece, to)
+        self.base_score += piece_base_term(piece, frm)
+        if captured:
+            self.base_score += piece_base_term(captured, to)
+            self.piece_count += 1
+        cells[frm] = piece
         cells[to] = captured
-        if (cells[frm] & 7) == 1:
-            self.kings[cells[frm] >> 3] = frm
+        if (piece & 7) == 1:
+            self.kings[piece >> 3] = frm
         self.turn = BLACK if self.turn == RED else RED
-        self.hash_stack.pop()
 
     # -- 重复局面 ---------------------------------------------------------
     def is_repetition(self) -> bool:

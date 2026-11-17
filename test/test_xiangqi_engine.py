@@ -115,6 +115,30 @@ class TestNotation(unittest.TestCase):
 
 
 class TestDecisionAPI(unittest.TestCase):
+    def test_opening_book_start(self):
+        result = decide_position(fen=START_FEN, time_limit=0.1, max_depth=1)
+        best = result["best_move"]
+        self.assertTrue(result["search"]["book"])
+        self.assertEqual(best["iccs"], "h3e3")
+        self.assertEqual(best["chinese"], "炮二平五")
+        self.assertIn("book", best["tags"])
+
+    def test_grid_bottom_side_moves_first(self):
+        board = Board.from_fen(START_FEN)
+        # 黑方在下：第一步固定为我方（黑）先走 + 开局库
+        flipped = "\n".join("".join(reversed(line))
+                            for line in reversed(board.to_grid().splitlines()))
+        result = decide_position(grid=flipped, side=None, view_side="black",
+                                 time_limit=0.1, max_depth=1)
+        self.assertEqual(result["input"]["side_to_move"], "black")
+        self.assertEqual(result["input"]["our_side"], "black")
+        self.assertEqual(result["input"]["view_side"], "black")
+        self.assertTrue(result["search"]["book"])
+        self.assertEqual(result["best_move"]["iccs"], "h10g8")
+        self.assertEqual(result["best_move"]["color"], "black")
+        # PV 第一步必须是我方
+        self.assertEqual(result["pv"]["sides"][0], "black")
+
     def test_mate_in_one(self):
         result = decide_position(fen=MATE_IN_ONE_FEN, time_limit=1.5)
         best = result["best_move"]

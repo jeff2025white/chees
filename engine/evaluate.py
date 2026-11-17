@@ -2,6 +2,9 @@
 
 评分以红方视角计算（正数表示红方占优），搜索中按行棋方取正负。
 单位：厘兵（1 兵 = 100）。
+
+evaluate() 单次扫盘融合子力/PST/深入/出子/将帅安全，再单独扫列算控线，
+避免原先多次全盘遍历。Board.base_score 维护子力+PST+深入的增量值。
 """
 
 from .constants import (
@@ -78,7 +81,6 @@ CHARIOT_PST = [
     [0, 0, 2, 4, 6, 4, 2, 0, 0],
 ]
 
-# 士、象：鼓励留在原位防守，离开原位略微扣分（均为 0 基准的小表）
 ADVISOR_PST = [
     [0, 0, 0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -136,75 +138,169 @@ PST_FLAT = {
 # 黑方镜像格：上下翻转
 MIRROR = [(ROWS - 1 - r) * COLS + c for r in range(ROWS) for c in range(COLS)]
 
+# 深入惩罚预表：红方视角，按 (piece, sq) 查；非进攻子为 0
+_DEEP = [0] * 16 * SQUARES
+
+
+def _init_deep_table():
+    value = PIECE_VALUE
+    for ptype in (CANNON, HORSE, CHARIOT):
+        pen = max(30, int(value[ptype] * 0.2))
+        red = ptype
+        black = (BLACK << 3) | ptype
+        for sq in range(SQUARES):
+            r = sq // COLS
+            if r <= 2:
+                _DEEP[red * SQUARES + sq] = -pen
+            if r >= 7:
+                _DEEP[black * SQUARES + sq] = pen
+
+
+_init_deep_table()
+
+
+def piece_base_term(piece: int, sq: int) -> int:
+    """子力 + PST + 深入惩罚（红方视角）。空子返回 0。"""
+    if not piece:
+        return 0
+    ptype = piece & 7
+    if piece < 8:
+        return PIECE_VALUE[ptype] + PST_FLAT[ptype][sq] + _DEEP[piece * SQUARES + sq]
+    return -(PIECE_VALUE[ptype] + PST_FLAT[ptype][MIRROR[sq]]) + _DEEP[piece * SQUARES + sq]
+
+
+def compute_base_score(cells) -> int:
+    """全量重算子力+PST+深入（供 Board 初始化 / 校验）。"""
+    score = 0
+    for sq, piece in enumerate(cells):
+        if piece:
+            score += piece_base_term(piece, sq)
+    return score
+
+
+def is_opening_cells(cells, piece_count: int) -> bool:
+    """开局：棋子多且双方将帅仍在原位。O(1)。"""
+    return piece_count > 26 and cells[85] == 1 and cells[4] == 9
+
 
 def _is_opening(board) -> bool:
-    """快速判断是否处于开局阶段。
-
-    条件：棋子总数 > 26 且双方帅都在初始原位（红帅 row9 col4, 黑帅 row0 col4）。
-    这样既覆盖开局也覆盖开局刚走完几步的阶段。
-    """
+    """兼容旧调用；优先用 Board 缓存。"""
+    pc = getattr(board, "piece_count", None)
+    if pc is not None:
+        return is_opening_cells(board.cells, pc)
     cells = board.cells
-    # 红帅 (0<<3)|1 = 1 在 row 9 col 4 → sq=9*9+4=85
-    # 黑帅 (1<<3)|1 = 9 在 row 0 col 4 → sq=4
     if cells[85] != 1 or cells[4] != 9:
         return False
-    # 棋子总数还很多
-    total = sum(1 for p in cells if p != 0)
-    return total > 26
+    return sum(1 for p in cells if p != 0) > 26
 
 
-def _deep_advance_penalty(board) -> int:
-    """进攻子（炮/马/车）深入对方底线附近的风险惩罚。
-
-    不管开局/中局/残局，进攻子跑到对方底线 row 0-2（红方视角）
-    都是危险位置——无根、容易被捉。按自身价值 20% 扣分，让引擎
-    意识到"虽然吃了子但送了个子到对方家门口"。
-
-    只扣真正有风险的进攻子（炮/马/车），相/仕/兵过河不扣。
-    """
-    cells = board.cells
-    value = PIECE_VALUE
+def _file_control_from_cols(file_red, file_black, file_blockers) -> int:
+    """按列缓存的车炮/挡子计数算控线分。"""
     score = 0
-    for sq in range(SQUARES):
-        piece = cells[sq]
-        if piece == EMPTY:
-            continue
-        ptype = piece & 7
-        if ptype not in (CANNON, HORSE, CHARIOT):
-            continue
-        r = sq // COLS
-        if piece < 8 and r <= 2:       # 红方进攻子在对方底线 row 0-2
-            score -= max(30, int(value[ptype] * 0.2))
-        elif piece >= 8 and r >= 7:    # 黑方进攻子在红方底线 row 7-9（红方视角加分）
-            score += max(30, int(value[ptype] * 0.2))
+    for c in range(COLS):
+        blockers = file_blockers[c]
+        open_bonus = 14 if blockers == 0 else (8 if blockers <= 2 else 0)
+        center = 6 if c == 4 else (3 if c in (3, 5) else 0)
+        for ptype in file_red[c]:
+            score += open_bonus + center + (4 if ptype == CHARIOT else 2)
+        for ptype in file_black[c]:
+            score -= open_bonus + center + (4 if ptype == CHARIOT else 2)
     return score
 
 
 def evaluate(board) -> int:
     """返回红方视角的静态评分（厘兵）。
 
-    基础评分 = 子力价值 + 位置分（7 张 PST 表）+ 进攻子深入底线风险惩罚。
-    风险惩罚无条件生效——炮在对方底线不管是不是开局都是坏位置。
+    优先使用 Board.base_score（子力+PST+深入增量），单次扫盘补算出子/将帅，
+    再扫列算控线。
     """
     cells = board.cells
-    value = PIECE_VALUE
-    flat = PST_FLAT
-    mirror = MIRROR
-    score = 0
+    base = getattr(board, "base_score", None)
+    if base is None:
+        score = compute_base_score(cells)
+    else:
+        score = base
+
+    opening = _is_opening(board)
+    red_a = red_e = black_a = black_e = 0
+    devel = 0
+
+    # 控线：按列收集车炮与挡子
+    file_red = [[] for _ in range(COLS)]
+    file_black = [[] for _ in range(COLS)]
+    file_blockers = [0] * COLS
+
+    # 开局马原位惩罚（常数格）
+    if opening:
+        if cells[82] == HORSE:
+            devel -= 16
+        if cells[88] == HORSE:
+            devel -= 16
+        if cells[1] == ((BLACK << 3) | HORSE):
+            devel += 16
+        if cells[7] == ((BLACK << 3) | HORSE):
+            devel += 16
 
     for sq in range(SQUARES):
-        piece = cells[sq]
-        if piece == EMPTY:
+        p = cells[sq]
+        if p == EMPTY:
             continue
-        ptype = piece & 7
-        if piece < 8:  # 红方棋子编码 1..7
-            score += value[ptype] + flat[ptype][sq]
-        else:          # 黑方棋子编码 9..15
-            score -= value[ptype] + flat[ptype][mirror[sq]]
+        ptype = p & 7
+        r, c = divmod(sq, COLS)
 
-    # 无条件风险惩罚（进攻子深入对方底线）
-    score += _deep_advance_penalty(board)
+        if ptype in (CHARIOT, CANNON):
+            if p < 8:
+                file_red[c].append(ptype)
+            else:
+                file_black[c].append(ptype)
+        else:
+            file_blockers[c] += 1
 
+        if p < 8:
+            if ptype == ADVISOR and r >= 7:
+                red_a += 1
+            elif ptype == ELEPHANT and r >= 5:
+                red_e += 1
+            if opening:
+                if ptype == HORSE and sq not in (82, 88):
+                    devel += 18
+                elif ptype == CANNON and c == 4:
+                    devel += 24
+                elif ptype == CANNON and c in (2, 6):
+                    devel += 8
+                elif ptype == PAWN and r == 5 and c in (0, 2, 4, 6, 8):
+                    devel += 10
+                elif ptype == CHARIOT and r < 9:
+                    devel += 6
+        else:
+            if ptype == ADVISOR and r <= 2:
+                black_a += 1
+            elif ptype == ELEPHANT and r <= 4:
+                black_e += 1
+            if opening:
+                if ptype == HORSE and sq not in (1, 7):
+                    devel -= 18
+                elif ptype == CANNON and c == 4:
+                    devel -= 24
+                elif ptype == CANNON and c in (2, 6):
+                    devel -= 8
+                elif ptype == PAWN and r == 4 and c in (0, 2, 4, 6, 8):
+                    devel -= 10
+                elif ptype == CHARIOT and r > 0:
+                    devel -= 6
+
+    score += devel
+    score += red_a * 12 + red_e * 10
+    score -= black_a * 12 + black_e * 10
+    if red_a == 0:
+        score -= 18
+    if red_e == 0:
+        score -= 14
+    if black_a == 0:
+        score += 18
+    if black_e == 0:
+        score += 14
+    score += _file_control_from_cols(file_red, file_black, file_blockers)
     return score
 
 
@@ -212,3 +308,21 @@ def evaluate_for(board, color: int) -> int:
     """返回指定方视角的评分。"""
     score = evaluate(board)
     return score if color == RED else -score
+
+
+def see_value(board, move) -> int:
+    """静态交换近似：吃子收益 − 己方最小被吃回代价（一层）。
+
+    用于吃子排序与静态搜索差值剪枝；不追求完美 SEE 树。
+    """
+    frm, to = move
+    cells = board.cells
+    victim = cells[to]
+    if not victim:
+        return 0
+    gain = PIECE_VALUE[victim & 7]
+    # 粗估：落点被对方攻击时，减去攻击方最小子力（用己方棋子价值近似）
+    attacker = cells[frm]
+    # 走后己方子停在 to，若对方能吃回，至少亏掉 attacker 价值的一部分
+    # 这里用简单启发：gain - attacker/4，避免无根瞎吃
+    return gain - (PIECE_VALUE[attacker & 7] >> 2)

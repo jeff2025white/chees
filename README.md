@@ -43,6 +43,22 @@ python -m engine          # 引擎命令行
 
 `test/` 下其余 `diag_*.py`、`find_grid*.py`、`recognize_v*.py` 是调试历史遗留，不是入口，可以忽略。
 
+## 防回退契约（曾反复出错，改代码前先看）
+
+更完整条文见 `.cursor/rules/xiangqi-side-pv-annotate.mdc`（Cursor 会自动带上）。
+
+1. **我方 = 棋盘下半部**，由 `view_side` 决定，**不是**固定红色，也不是「谁在走谁就是我方」。
+2. **推演序列步数 ≈ 迭代深度**，禁止只返回 / 只显示 1 手（开局库第 1 手后必须续搜补满）。
+3. **棋盘标注必须同时画前 2 手**：第 1 手我方（红线圆）、第 2 手对方（绿/黄框）；先画对方再画我方。
+
+截图分析固定调用：
+
+```python
+decide_position(grid=analysis.grid_str,
+                side=analysis.view_side,        # 我方先走 = 下半边
+                view_side=analysis.view_side)
+```
+
 ## 坐标契约（最容易出错的地方）
 
 三套坐标，**不要在中间层随手翻转**：
@@ -53,13 +69,7 @@ python -m engine          # 引擎命令行
 3. **界面坐标**：`decide_position` 的输出（`best_move.from/to`、`pv.steps`）**已经**按
    `view_side` 转成图像方向，取来即可直接画，**不要再镜像一次**。
 
-`view_side` = 图片下方是哪一方（`Analysis.view_side`），也等于“我方”。界面计算时：
-
-```python
-decide_position(grid=analysis.grid_str,
-                side=analysis.view_side,        # 我方 = 下半边
-                view_side=analysis.view_side)
-```
+`view_side` = 图片下方是哪一方（`Analysis.view_side`），也等于“我方”。
 
 棋盘格中心用 `Analysis.cell_center(row, col)`，内部是“相邻两条网格线中点”，不是线 + cell/2。
 
@@ -88,14 +98,14 @@ vis = annotate(analysis, d)
 
 ## 标注样式
 
-在 `engine/recognize.py` 的 `annotate()` 内：
+在 `engine/recognize.py` 的 `annotate()` 内（**两手都要画，缺一即回退**）：
 
-- 我方：红色连线 + 起点红圈白内圈 + 终点蓝色空心圆
-- 对方第 1 步应手（PV 第 2 步）：绿色连线 + 绿色方框起点 + 黄色方框终点
+- 我方（`pv.steps[0]`）：红色连线 + 起点红圈白内圈 + 终点蓝色空心圆
+- 对方（`pv.steps[1]`）：绿色连线 + 绿色方框起点 + 黄色方框终点
 - 先画对方、后画我方，保证我方在最上层
 - 顶部有半透明底的中文着法与评分
 
-颜色是 BGR 顺序，例如 `(0, 0, 255)` 是红色。
+颜色是 BGR 顺序，例如 `(0, 0, 255)` 是红色。标注里的「红/绿」是**走位样式**，与棋子红黑无关。
 
 ## 常见修改
 
