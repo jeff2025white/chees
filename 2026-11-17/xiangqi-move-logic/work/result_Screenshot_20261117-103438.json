@@ -1,0 +1,171 @@
+{
+  "ok": true,
+  "input": {
+    "fen": "r1bakab1r/9/2c1c1cc1/p1p1p1p1p/9/9/P1P1P1P1P/1C2C1C2/9/RNBAKABN1 w - - 0 1",
+    "grid": "r.bakab.r\n.........\n..c.c.cc.\np.p.p.p.p\n.........\n.........\nP.P.P.P.P\n.C..C.C..\n.........\nRNBAKABN.",
+    "side_to_move": "red",
+    "our_side": "red",
+    "view_side": "black",
+    "in_check": false,
+    "legal_move_count": 36
+  },
+  "coordinate_contract": {
+    "cols": 9,
+    "rows": 10,
+    "col_range": "0..8，从左到右（图左为 0）",
+    "row_range": "0..9，从上到下（图上方为 0）",
+    "orientation": "row 9 为我方（图下方）底线；我方执黑时坐标已整体镜像",
+    "view_side": "black",
+    "pixel_mapping": "x = margin_x + col * cell_w, y = margin_y + row * cell_h"
+  },
+  "status": "playing",
+  "best_move": {
+    "from": {
+      "col": 7,
+      "row": 0
+    },
+    "to": {
+      "col": 6,
+      "row": 2
+    },
+    "from_sq": "b1",
+    "to_sq": "c3",
+    "iccs": "b1c3",
+    "ucci": "b0c2",
+    "chinese": "马八进七",
+    "piece": "马",
+    "color": "red",
+    "captured": null,
+    "is_capture": false,
+    "gives_check": false,
+    "is_mate": false,
+    "mate_in": null,
+    "score_cp": -544,
+    "score_text": "-5.44",
+    "score_exact": true,
+    "score_depth": null,
+    "reason": "出动马，抢占要道、增强进攻子力；下一步可白吃对方卒。",
+    "tags": [
+      "development",
+      "threat"
+    ]
+  },
+  "alternatives": [
+    {
+      "from": {
+        "col": 4,
+        "row": 2
+      },
+      "to": {
+        "col": 4,
+        "row": 6
+      },
+      "from_sq": "e3",
+      "to_sq": "e7",
+      "iccs": "e3e7",
+      "ucci": "e2e6",
+      "chinese": "炮五进四",
+      "piece": "炮",
+      "color": "red",
+      "captured": "卒",
+      "is_capture": true,
+      "gives_check": true,
+      "is_mate": false,
+      "mate_in": null,
+      "score_cp": -550,
+      "score_text": "-5.50",
+      "score_exact": true,
+      "score_depth": 3,
+      "reason": "白吃对方一卒；并同时将军。",
+      "tags": [
+        "capture",
+        "free_capture",
+        "check"
+      ]
+    },
+    {
+      "from": {
+        "col": 2,
+        "row": 2
+      },
+      "to": {
+        "col": 2,
+        "row": 6
+      },
+      "from_sq": "g3",
+      "to_sq": "g7",
+      "iccs": "g3g7",
+      "ucci": "g2g6",
+      "chinese": "炮三进四",
+      "piece": "炮",
+      "color": "red",
+      "captured": "卒",
+      "is_capture": true,
+      "gives_check": false,
+      "is_mate": false,
+      "mate_in": null,
+      "score_cp": -550,
+      "score_text": "-5.50",
+      "score_exact": true,
+      "score_depth": 3,
+      "reason": "白吃对方一卒。",
+      "tags": [
+        "capture",
+        "free_capture"
+      ]
+    },
+    {
+      "from": {
+        "col": 8,
+        "row": 3
+      },
+      "to": {
+        "col": 8,
+        "row": 4
+      },
+      "from_sq": "a4",
+      "to_sq": "a5",
+      "iccs": "a4a5",
+      "ucci": "a3a4",
+      "chinese": "兵九进一",
+      "piece": "兵",
+      "color": "red",
+      "captured": null,
+      "is_capture": false,
+      "gives_check": false,
+      "is_mate": false,
+      "mate_in": null,
+      "score_cp": -643,
+      "score_text": "-6.43",
+      "score_exact": true,
+      "score_depth": 3,
+      "reason": "推进兵线，为后续进攻做准备；下一步可白吃对方卒。",
+      "tags": [
+        "development",
+        "threat"
+      ]
+    }
+  ],
+  "pv": {
+    "iccs": [
+      "b1c3",
+      "h8h7",
+      "g3g7",
+      "c8c4"
+    ],
+    "chinese": [
+      "马八进七",
+      "炮8进1",
+      "炮三进四",
+      "炮3进4"
+    ]
+  },
+  "search": {
+    "depth": 4,
+    "nodes": 30240,
+    "time_ms": 2901,
+    "score_cp": -544,
+    "mate_in": null
+  },
+  "message": "出动马，抢占要道、增强进攻子力；下一步可白吃对方卒。"
+}

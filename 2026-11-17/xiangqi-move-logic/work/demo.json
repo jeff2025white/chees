@@ -1,0 +1,136 @@
+{
+  "ok": true,
+  "input": {
+    "fen": "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1",
+    "grid": "rnbakabnr\n.........\n.c.....c.\np.p.p.p.p\n.........\n.........\nP.P.P.P.P\n.C.....C.\n.........\nRNBAKABNR",
+    "side_to_move": "red",
+    "our_side": "red",
+    "view_side": "red",
+    "in_check": false,
+    "legal_move_count": 44
+  },
+  "coordinate_contract": {
+    "cols": 9,
+    "rows": 10,
+    "col_range": "0..8，从左到右（图左为 0）",
+    "row_range": "0..9，从上到下（图上方为 0）",
+    "orientation": "row 9 为我方（图下方）底线；我方执黑时坐标已整体镜像",
+    "view_side": "red",
+    "pixel_mapping": "x = margin_x + col * cell_w, y = margin_y + row * cell_h"
+  },
+  "status": "playing",
+  "best_move": {
+    "from": {
+      "col": 1,
+      "row": 7
+    },
+    "to": {
+      "col": 2,
+      "row": 7
+    },
+    "from_sq": "b3",
+    "to_sq": "c3",
+    "iccs": "b3c3",
+    "ucci": "b2c2",
+    "chinese": "炮八平七",
+    "piece": "炮",
+    "color": "red",
+    "captured": null,
+    "is_capture": false,
+    "gives_check": false,
+    "is_mate": false,
+    "mate_in": null,
+    "score_cp": 0,
+    "score_text": "+0.00",
+    "score_exact": true,
+    "score_depth": null,
+    "reason": "出动炮，抢占要道、增强进攻子力。",
+    "tags": [
+      "development"
+    ]
+  },
+  "alternatives": [
+    {
+      "from": {
+        "col": 1,
+        "row": 7
+      },
+      "to": {
+        "col": 4,
+        "row": 7
+      },
+      "from_sq": "b3",
+      "to_sq": "e3",
+      "iccs": "b3e3",
+      "ucci": "b2e2",
+      "chinese": "炮八平五",
+      "piece": "炮",
+      "color": "red",
+      "captured": null,
+      "is_capture": false,
+      "gives_check": false,
+      "is_mate": false,
+      "mate_in": null,
+      "score_cp": 0,
+      "score_text": "+0.00",
+      "score_exact": true,
+      "score_depth": 3,
+      "reason": "出动炮，抢占要道、增强进攻子力；占据中路要点。",
+      "tags": [
+        "development"
+      ]
+    },
+    {
+      "from": {
+        "col": 2,
+        "row": 6
+      },
+      "to": {
+        "col": 2,
+        "row": 5
+      },
+      "from_sq": "c4",
+      "to_sq": "c5",
+      "iccs": "c4c5",
+      "ucci": "c3c4",
+      "chinese": "兵七进一",
+      "piece": "兵",
+      "color": "red",
+      "captured": null,
+      "is_capture": false,
+      "gives_check": false,
+      "is_mate": false,
+      "mate_in": null,
+      "score_cp": 0,
+      "score_text": "+0.00",
+      "score_exact": true,
+      "score_depth": 3,
+      "reason": "推进兵线，为后续进攻做准备。",
+      "tags": [
+        "development"
+      ]
+    }
+  ],
+  "pv": {
+    "iccs": [
+      "b3c3",
+      "b8c8",
+      "c3c7",
+      "c8c4"
+    ],
+    "chinese": [
+      "炮八平七",
+      "炮2平3",
+      "炮七进四",
+      "炮3进4"
+    ]
+  },
+  "search": {
+    "depth": 4,
+    "nodes": 53778,
+    "time_ms": 4227,
+    "score_cp": 0,
+    "mate_in": null
+  },
+  "message": "出动炮，抢占要道、增强进攻子力。"
+}

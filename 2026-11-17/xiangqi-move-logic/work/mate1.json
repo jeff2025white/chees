@@ -1,0 +1,133 @@
+{
+  "ok": true,
+  "input": {
+    "fen": "3ak4/8R/5a3/3N5/9/9/9/9/9/3K5 w - - 0 1",
+    "grid": "...ak....\n........R\n.....a...\n...N.....\n.........\n.........\n.........\n.........\n.........\n...K.....",
+    "side_to_move": "red",
+    "our_side": "red",
+    "view_side": "red",
+    "in_check": false,
+    "legal_move_count": 26
+  },
+  "coordinate_contract": {
+    "cols": 9,
+    "rows": 10,
+    "col_range": "0..8，从左到右（图左为 0）",
+    "row_range": "0..9，从上到下（图上方为 0）",
+    "orientation": "row 9 为我方（图下方）底线；我方执黑时坐标已整体镜像",
+    "view_side": "red",
+    "pixel_mapping": "x = margin_x + col * cell_w, y = margin_y + row * cell_h"
+  },
+  "status": "playing",
+  "best_move": {
+    "from": {
+      "col": 8,
+      "row": 1
+    },
+    "to": {
+      "col": 8,
+      "row": 0
+    },
+    "from_sq": "i9",
+    "to_sq": "i10",
+    "iccs": "i9i10",
+    "ucci": "i8i9",
+    "chinese": "车一进一",
+    "piece": "车",
+    "color": "red",
+    "captured": null,
+    "is_capture": false,
+    "gives_check": true,
+    "is_mate": true,
+    "mate_in": 1,
+    "score_cp": 99999,
+    "score_text": "绝杀(1步)",
+    "score_exact": true,
+    "score_depth": null,
+    "reason": "直接绝杀，对手已无合法应着。",
+    "tags": [
+      "mate"
+    ]
+  },
+  "alternatives": [
+    {
+      "from": {
+        "col": 8,
+        "row": 1
+      },
+      "to": {
+        "col": 5,
+        "row": 1
+      },
+      "from_sq": "i9",
+      "to_sq": "f9",
+      "iccs": "i9f9",
+      "ucci": "i8f8",
+      "chinese": "车一平四",
+      "piece": "车",
+      "color": "red",
+      "captured": null,
+      "is_capture": false,
+      "gives_check": false,
+      "is_mate": false,
+      "mate_in": 2,
+      "score_cp": 99997,
+      "score_text": "绝杀(2步)",
+      "score_exact": true,
+      "score_depth": 2,
+      "reason": "出动车，抢占要道、增强进攻子力；占据中路要点；下一步可白吃对方士。",
+      "tags": [
+        "development",
+        "threat"
+      ]
+    },
+    {
+      "from": {
+        "col": 3,
+        "row": 3
+      },
+      "to": {
+        "col": 5,
+        "row": 2
+      },
+      "from_sq": "d7",
+      "to_sq": "f8",
+      "iccs": "d7f8",
+      "ucci": "d6f7",
+      "chinese": "马六进四",
+      "piece": "马",
+      "color": "red",
+      "captured": "士",
+      "is_capture": true,
+      "gives_check": true,
+      "is_mate": false,
+      "mate_in": null,
+      "score_cp": 1148,
+      "score_text": "+11.48",
+      "score_exact": true,
+      "score_depth": 2,
+      "reason": "白吃对方一士；并同时将军。",
+      "tags": [
+        "capture",
+        "free_capture",
+        "check"
+      ]
+    }
+  ],
+  "pv": {
+    "iccs": [
+      "i9i10"
+    ],
+    "chinese": [
+      "车一进一"
+    ]
+  },
+  "search": {
+    "depth": 1,
+    "nodes": 305,
+    "time_ms": 11,
+    "score_cp": 99999,
+    "mate_in": 1
+  },
+  "message": "直接绝杀，对手已无合法应着。"
+}

@@ -1,0 +1,175 @@
+{
+  "ok": true,
+  "input": {
+    "fen": "1nbakab2/9/2c1c1c1c/p1p1p2Rp/9/1R7/P1r1P3P/2C1C1C1C/9/1NBAKA3 w - - 0 1",
+    "grid": ".nbakab..\n.........\n..c.c.c.c\np.p.p..Rp\n.........\n.R.......\nP.r.P...P\n..C.C.C.C\n.........\n.NBAKA...",
+    "side_to_move": "red",
+    "our_side": "red",
+    "view_side": "black",
+    "in_check": false,
+    "legal_move_count": 59
+  },
+  "coordinate_contract": {
+    "cols": 9,
+    "rows": 10,
+    "col_range": "0..8，从左到右（图左为 0）",
+    "row_range": "0..9，从上到下（图上方为 0）",
+    "orientation": "row 9 为我方（图下方）底线；我方执黑时坐标已整体镜像",
+    "view_side": "black",
+    "pixel_mapping": "x = margin_x + col * cell_w, y = margin_y + row * cell_h"
+  },
+  "status": "playing",
+  "best_move": {
+    "from": {
+      "col": 7,
+      "row": 4
+    },
+    "to": {
+      "col": 7,
+      "row": 9
+    },
+    "from_sq": "b5",
+    "to_sq": "b10",
+    "iccs": "b5b10",
+    "ucci": "b4b9",
+    "chinese": "车八进五",
+    "piece": "车",
+    "color": "red",
+    "captured": "马",
+    "is_capture": true,
+    "gives_check": false,
+    "is_mate": false,
+    "mate_in": null,
+    "score_cp": 1120,
+    "score_text": "+11.20",
+    "score_exact": true,
+    "score_depth": null,
+    "reason": "白吃对方一马；下一步可白吃对方象。",
+    "tags": [
+      "capture",
+      "free_capture",
+      "threat"
+    ]
+  },
+  "alternatives": [
+    {
+      "from": {
+        "col": 0,
+        "row": 2
+      },
+      "to": {
+        "col": 0,
+        "row": 6
+      },
+      "from_sq": "i3",
+      "to_sq": "i7",
+      "iccs": "i3i7",
+      "ucci": "i2i6",
+      "chinese": "炮一进四",
+      "piece": "炮",
+      "color": "red",
+      "captured": "卒",
+      "is_capture": true,
+      "gives_check": false,
+      "is_mate": false,
+      "mate_in": null,
+      "score_cp": 910,
+      "score_text": "+9.10",
+      "score_exact": true,
+      "score_depth": 3,
+      "reason": "白吃对方一卒；下一步可白吃对方马。",
+      "tags": [
+        "capture",
+        "free_capture",
+        "threat"
+      ]
+    },
+    {
+      "from": {
+        "col": 4,
+        "row": 2
+      },
+      "to": {
+        "col": 4,
+        "row": 6
+      },
+      "from_sq": "e3",
+      "to_sq": "e7",
+      "iccs": "e3e7",
+      "ucci": "e2e6",
+      "chinese": "炮五进四",
+      "piece": "炮",
+      "color": "red",
+      "captured": "卒",
+      "is_capture": true,
+      "gives_check": true,
+      "is_mate": false,
+      "mate_in": null,
+      "score_cp": 908,
+      "score_text": "+9.08",
+      "score_exact": true,
+      "score_depth": 3,
+      "reason": "白吃对方一卒；并同时将军；下一步可白吃对方马。",
+      "tags": [
+        "capture",
+        "free_capture",
+        "check",
+        "threat"
+      ]
+    },
+    {
+      "from": {
+        "col": 6,
+        "row": 2
+      },
+      "to": {
+        "col": 6,
+        "row": 6
+      },
+      "from_sq": "c3",
+      "to_sq": "c7",
+      "iccs": "c3c7",
+      "ucci": "c2c6",
+      "chinese": "炮七进四",
+      "piece": "炮",
+      "color": "red",
+      "captured": "卒",
+      "is_capture": true,
+      "gives_check": false,
+      "is_mate": false,
+      "mate_in": null,
+      "score_cp": 544,
+      "score_text": "+5.44",
+      "score_exact": true,
+      "score_depth": 3,
+      "reason": "吃掉对方一卒；注意落点暂无保护，可能被对方吃回；下一步可白吃对方马。",
+      "tags": [
+        "capture",
+        "risky",
+        "threat"
+      ]
+    }
+  ],
+  "pv": {
+    "iccs": [
+      "b5b10",
+      "e8e4",
+      "e3e7",
+      "g8f8"
+    ],
+    "chinese": [
+      "车八进五",
+      "炮5进4",
+      "炮五进四",
+      "炮7平6"
+    ]
+  },
+  "search": {
+    "depth": 4,
+    "nodes": 38912,
+    "time_ms": 3452,
+    "score_cp": 1120,
+    "mate_in": null
+  },
+  "message": "白吃对方一马；下一步可白吃对方象。"
+}
