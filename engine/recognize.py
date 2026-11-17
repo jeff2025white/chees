@@ -14,8 +14,12 @@
     九宫找不到时兜底扫描下半场（row 5-9）。
 """
 
+import os
+
 import cv2
 import numpy as np
+
+from .constants import FEN_TO_PIECE, PIECE_NAMES
 
 # 基准分辨率（本批截图均为 720×1280）的比例参数
 _REF_W = 720.0
@@ -37,11 +41,80 @@ RED = set("RNBAKCP")
 # 棋子检测
 # --------------------------------------------------------------------------
 
-def detect_pieces(crop):
-    """连通域 + 面积 + 圆形度过滤，返回 [(cx, cy, 'R'|'B', area)]。"""
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+def _piece_masks(hsv):
+    """红 / 暗黑 / 亮棕黑 三路 HSV mask。
+
+    亮棕（orange）覆盖部分屏幕上「黑子底色偏亮棕」的变体：V 很高，
+    不进 black_mask（V<100），也不进 red_mask（H 在 10–20）。
+    """
     red_mask = ((hsv[..., 0] < 10) | (hsv[..., 0] > 160)) & (hsv[..., 1] > 80) & (hsv[..., 2] > 80)
-    black_mask = (hsv[..., 2] > 40) & (hsv[..., 2] < 100) & (hsv[..., 1] < 100) & (hsv[..., 0] < 30)
+    black_mask = (
+        (hsv[..., 2] > 40) & (hsv[..., 2] < 100)
+        & (hsv[..., 1] < 100) & (hsv[..., 0] < 30)
+    )
+    orange_mask = (
+        (hsv[..., 0] >= 10) & (hsv[..., 0] <= 20)
+        & (hsv[..., 1] >= 80) & (hsv[..., 2] >= 120) & (hsv[..., 2] <= 240)
+    )
+    orange_mask = orange_mask & ~red_mask
+    return red_mask, black_mask, orange_mask
+
+
+def _cell_color(rr, br, oran=0.0):
+    """由窗口内红/暗黑 mask 均值判 '@' / '#' / '.'。
+
+    oran 保留参数以兼容调用；亮棕补漏不在颜色阈值里做（与木纹不可分），
+    而在 classify 之后用底线马位间隙修复。
+    """
+    if rr > 0.04 and rr > br * 1.2:
+        return "@"
+    if br > 0.05 and br > rr * 1.2:
+        return "#"
+    if rr > br * 0.8 and rr > 0.02:
+        return "@"
+    if br > rr * 0.8 and br > 0.02:
+        return "#"
+    return "."
+
+
+def _repair_backrow_horse_gaps(grid):
+    """补回底线漏检的马位（col 1 / 7）。
+
+    亮棕黑子常在 HSV 上与棋盘木纹不可分，连通域与格心 mask 都会漏。
+    若某一行已有 ≥7 枚同色子且马位为空、左右邻为该色，则补上。
+    只动 row 0-2 / 7-9，避免中局误补。
+    """
+    for r in (0, 1, 2, 7, 8, 9):
+        row = grid[r]
+        occupied = [c for c in range(COLS) if row[c] != "."]
+        if len(occupied) < 7:
+            continue
+        n_at = sum(1 for c in occupied if row[c] == "@")
+        n_hash = sum(1 for c in occupied if row[c] == "#")
+        if n_at >= 7 and n_at > n_hash:
+            maj = "@"
+        elif n_hash >= 7 and n_hash > n_at:
+            maj = "#"
+        else:
+            continue
+        for c in (1, 7):
+            if row[c] != ".":
+                continue
+            left = row[c - 1] if c - 1 >= 0 else "."
+            right = row[c + 1] if c + 1 < COLS else "."
+            if left == maj or right == maj:
+                row[c] = maj
+    return grid
+
+
+def detect_pieces(crop):
+    """连通域 + 面积 + 圆形度过滤，返回 [(cx, cy, 'R'|'B', area)]。
+
+    只用红 + 暗黑 mask 做连通域（亮棕与棋盘木纹接近，并入会污染网格）。
+    亮棕黑子漏检由 classify() 格心二次判定补回。
+    """
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    red_mask, black_mask, _orange = _piece_masks(hsv)
     piece_mask = (red_mask | black_mask).astype(np.uint8)
 
     num, _labels, stats, cents = cv2.connectedComponentsWithStats(piece_mask, connectivity=8)
@@ -61,8 +134,8 @@ def detect_pieces(crop):
         r = int(15 * scale)
         y0, y1 = max(0, int(cy) - r), min(crop.shape[0], int(cy) + r)
         x0, x1 = max(0, int(cx) - r), min(crop.shape[1], int(cx) + r)
-        rp = red_mask[y0:y1, x0:x1].mean()
-        bp = black_mask[y0:y1, x0:x1].mean()
+        rp = float(red_mask[y0:y1, x0:x1].mean())
+        bp = float(black_mask[y0:y1, x0:x1].mean())
         pieces.append((float(cx), float(cy), "R" if rp > bp else "B", float(area)))
     return pieces
 
@@ -193,13 +266,11 @@ def find_grid(crop, pieces=None):
 def classify(crop, row0, col0, cell):
     """返回 (grid_raw, centers)：'@'=红 '#'=黑 '.'=空。
 
-    用 red_mask / black_mask 比例判棋子有无和颜色。
+    格心用红/暗黑 mask；随后对底线马位做间隙修复，补亮棕黑子漏检。
     """
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     h, w = crop.shape[:2]
-
-    red_mask = ((hsv[..., 0] < 10) | (hsv[..., 0] > 160)) & (hsv[..., 1] > 80) & (hsv[..., 2] > 80)
-    black_mask = (hsv[..., 2] > 40) & (hsv[..., 2] < 100) & (hsv[..., 1] < 100) & (hsv[..., 0] < 30)
+    red_mask, black_mask, _orange = _piece_masks(hsv)
 
     rad = max(6, int(cell * 0.22))
     grid, centers = [], []
@@ -214,38 +285,33 @@ def classify(crop, row0, col0, cell):
             if y1 - y0 < 4 or x1 - x0 < 4:
                 line.append(".")
                 continue
-            rr = red_mask[y0:y1, x0:x1].mean()
-            br = black_mask[y0:y1, x0:x1].mean()
-            if rr > 0.04 and rr > br * 1.2:
-                line.append("@")
-            elif br > 0.05 and br > rr * 1.2:
-                line.append("#")
-            elif rr > br * 0.8 and rr > 0.02:
-                line.append("@")
-            elif br > rr * 0.8 and br > 0.02:
-                line.append("#")
-            else:
-                line.append(".")
+            rr = float(red_mask[y0:y1, x0:x1].mean())
+            br = float(black_mask[y0:y1, x0:x1].mean())
+            line.append(_cell_color(rr, br))
         grid.append(line)
+    _repair_backrow_horse_gaps(grid)
     return grid, centers
 
 
 # --------------------------------------------------------------------------
-# 兵种推断（位置先验）
+# 兵种推断（开局位置种子 + 单格墨迹 OCR）
 # --------------------------------------------------------------------------
 
-def infer_pieces(grid_raw, side=None):
+def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None):
     """把 '@'/'#' 占位替换成真实兵种字母。
 
     side: 我方颜色，"red" 表示红方在下（row 9），"black" 表示黑方在下。
     若 side=None，用 detect_our_side(grid_raw) 自动识别。
+
+    有 crop 时：近开局（底线≥8）仍位置种子；其余一律 ``piece_ocr``。
+    无 crop 时才对真正底线 row0/9 做残缺九宫/象位种子。
     """
+    from . import piece_ocr
+
     grid = [list(row) for row in grid_raw]
     if side is None:
         side = detect_our_side(grid_raw) or "red"
-    our_side = side                    # 我方颜色 = side
-    # 红方是否在下方
-    red_bottom = (our_side == "red")
+    red_bottom = (side == "red")
     red_rows = [sum(1 for ch in row if ch == "@") for row in grid]
     black_rows = [sum(1 for ch in row if ch == "#") for row in grid]
 
@@ -264,37 +330,85 @@ def infer_pieces(grid_raw, side=None):
     red_back = pick_backrow(red_rows, not red_bottom)
     black_back = pick_backrow(black_rows, red_bottom)
 
-    if red_back is not None:
+    def backrow_complete(back, marker):
+        """近开局完整底线：两端车位都在，且同色 ≥8。
+
+        缺角（如只有 ``.@@@@@@@@``）时不能套 RNB… 模板，否则会把错位的
+        车标成马、占掉马配额，真马再被兜成车（见 103438）。
+        缺马（``R.BAKABNR`` / ``RNBAKAB.R``）两端仍在，可以安全套模板。
+        """
+        if back is None:
+            return False
+        if grid[back][0] != marker or grid[back][8] != marker:
+            return False
+        return sum(1 for c in range(COLS) if grid[back][c] == marker) >= 8
+
+    red_full = backrow_complete(red_back, "@")
+    black_full = backrow_complete(black_back, "#")
+
+    # 近开局：两端车位在且 ≥8 才套完整底线模板，并填经典炮/兵位
+    if red_full:
         for c in range(COLS):
             if grid[red_back][c] == "@":
                 grid[red_back][c] = RED_BACKROW[c]
-    if black_back is not None:
+    if black_full:
         for c in range(COLS):
             if grid[black_back][c] == "#":
                 grid[black_back][c] = BLACK_BACKROW[c]
 
-    def fill(backrow, marker, cannon, pawn, default):
+    def fill_cannon_pawn(backrow, marker, cannon, pawn):
         if backrow is None:
-            for r in range(ROWS):
-                for c in range(COLS):
-                    if grid[r][c] == marker:
-                        grid[r][c] = default
             return
-        # 炮/兵向对方半场推进：底线在顶部则 +1，在底部则 -1
         step = 1 if backrow <= 4 else -1
         cannon_row, pawn_row = backrow + 2 * step, backrow + 3 * step
-        for r, ch in ((cannon_row, cannon), (pawn_row, pawn)):
-            if 0 <= r < ROWS:
-                for c in range(COLS):
-                    if grid[r][c] == marker:
-                        grid[r][c] = ch
-        for r in range(ROWS):
-            for c in range(COLS):
-                if grid[r][c] == marker:
-                    grid[r][c] = default
+        if 0 <= cannon_row < ROWS:
+            for c in (1, 7):
+                if grid[cannon_row][c] == marker:
+                    grid[cannon_row][c] = cannon
+        if 0 <= pawn_row < ROWS:
+            for c in (0, 2, 4, 6, 8):
+                if grid[pawn_row][c] == marker:
+                    grid[pawn_row][c] = pawn
 
-    fill(red_back, "@", "C", "P", "R")
-    fill(black_back, "#", "c", "p", "r")
+    if red_full:
+        fill_cannon_pawn(red_back, "@", "C", "P")
+    if black_full:
+        fill_cannon_pawn(black_back, "#", "c", "p")
+
+    # 单格 OCR：填充所有残留 @/#
+    # 有 OCR 时不做「残缺底线」位置种子——pick_backrow 在中局常把 row2/7
+    # 误当成底线，会把马标成象、把将士配额占掉（见 112752）。
+    can_ocr = (
+        crop is not None and row0 is not None and col0 is not None and cell is not None
+    )
+    if can_ocr:
+        piece_ocr.ocr_fill_markers(
+            grid, crop, row0, col0, cell, side,
+            piece_masks_fn=_piece_masks,
+            elephant_valid_fn=_valid_elephant_positions,
+        )
+    else:
+        # 无图时才用残缺底线种子；且只允许真正底线 row0/9，禁止 row2/7
+        def seed_partial_backrow(back, marker, backrow_letters):
+            if back is None or back not in (0, ROWS - 1) or backrow_complete(back, marker):
+                return
+            for c, letter in ((4, backrow_letters[4]), (3, backrow_letters[3]),
+                              (5, backrow_letters[5])):
+                if grid[back][c] == marker:
+                    grid[back][c] = letter
+            for c in (2, 6):
+                if grid[back][c] == marker:
+                    grid[back][c] = backrow_letters[c]
+
+        seed_partial_backrow(red_back, "@", RED_BACKROW)
+        seed_partial_backrow(black_back, "#", BLACK_BACKROW)
+
+    for r in range(ROWS):
+        for c in range(COLS):
+            if grid[r][c] == "@":
+                grid[r][c] = "R"
+            elif grid[r][c] == "#":
+                grid[r][c] = "r"
     return grid
 
 
@@ -555,7 +669,7 @@ def analyze_image(path):
     # 在下方九宫主将确定我方颜色
     side = detect_our_side(grid_raw) or "red"
 
-    grid = infer_pieces(grid_raw, side=side)
+    grid = infer_pieces(grid_raw, side=side, crop=crop, row0=row0, col0=col0, cell=cell)
     valid, _msgs, violations = validate_grid(grid, side=side)
     return Analysis(path, img, box, row0, col0, cell, grid_raw, grid,
                     score, hit, side, valid=valid, violations=violations)
@@ -564,6 +678,103 @@ def analyze_image(path):
 # --------------------------------------------------------------------------
 # 对外：标注
 # --------------------------------------------------------------------------
+
+_CN_FONT_CANDIDATES = (
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/System/Library/Fonts/Supplemental/Songti.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "C:/Windows/Fonts/msyh.ttc",
+    "C:/Windows/Fonts/simhei.ttf",
+)
+
+
+def _piece_cn(ch):
+    """FEN 字母 -> 中文兵种名；未知则回退字母本身。"""
+    piece = FEN_TO_PIECE.get(ch)
+    if piece is None:
+        return ch
+    return PIECE_NAMES[(piece >> 3, piece & 7)]
+
+
+def _load_cn_font(size):
+    """按平台候选路径加载中文字体；失败返回 None。"""
+    from PIL import ImageFont
+
+    size = max(10, int(size))
+    for path in _CN_FONT_CANDIDATES:
+        if not os.path.isfile(path):
+            continue
+        try:
+            return ImageFont.truetype(path, size=size, index=0)
+        except OSError:
+            try:
+                return ImageFont.truetype(path, size=size)
+            except OSError:
+                continue
+    return None
+
+
+def _draw_piece_labels(vis, analysis, half):
+    """在每枚棋子描边方框左上角画中文兵种，颜色与棋子一致（红/黑）。
+
+    字下垫高反差底色块，便于在木纹棋盘上核对识别结果。
+    """
+    from PIL import Image, ImageDraw
+
+    font_px = max(12, int(analysis.cell * 0.32))
+    font = _load_cn_font(font_px)
+    pad = max(2, font_px // 8)
+    labels = []
+    for r in range(ROWS):
+        for c in range(COLS):
+            if analysis.grid_raw[r][c] == ".":
+                continue
+            ch = analysis.grid[r][c]
+            if ch in (".", "@", "#"):
+                continue
+            cx, cy = analysis.cell_center(r, c)
+            x = int(cx) - half + 2
+            y = int(cy) - half + 1
+            # RGB：红子红字+浅黄底，黑子黑字+浅青底
+            if ch.isupper():
+                color, bg = (200, 20, 20), (255, 245, 160)
+            else:
+                color, bg = (10, 10, 10), (180, 255, 240)
+            labels.append((_piece_cn(ch), ch, x, y, color, bg))
+
+    if not labels:
+        return vis
+
+    if font is None:
+        # 无中文字体时回退 FEN 字母（OpenCV 拉丁字库）
+        for _cn, ch, x, y, color, bg in labels:
+            bgr = (color[2], color[1], color[0])
+            bg_bgr = (bg[2], bg[1], bg[0])
+            baseline_y = y + int(font_px * 0.85)
+            (tw, th), _ = cv2.getTextSize(ch, cv2.FONT_HERSHEY_SIMPLEX,
+                                          font_px / 28.0, 1)
+            cv2.rectangle(vis, (x - pad, y - pad),
+                          (x + tw + pad, y + th + pad), bg_bgr, -1)
+            cv2.putText(vis, ch, (x, baseline_y), cv2.FONT_HERSHEY_SIMPLEX,
+                        font_px / 28.0, bgr, 1, cv2.LINE_AA)
+        return vis
+
+    rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(pil)
+    for text, _ch, x, y, color, bg in labels:
+        box = draw.textbbox((x, y), text, font=font)
+        draw.rectangle(
+            (box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad),
+            fill=bg,
+        )
+        draw.text((x, y), text, font=font, fill=color)
+    return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+
 
 def annotate(analysis, decision, draw_grid=True):
     """把网格、棋子圈与最佳着法画到原图上，返回新图（BGR）。"""
@@ -582,6 +793,9 @@ def annotate(analysis, decision, draw_grid=True):
             cx, cy = int(cx), int(cy)
             cv2.rectangle(vis, (cx - half, cy - half), (cx + half, cy + half),
                           (0, 0, 0), 2)
+
+    # --- 兵种文字：描边方框左上角，字色与棋子红/黑一致 ---
+    vis = _draw_piece_labels(vis, a, half)
 
     # --- 合法性校验：非法棋子画红X ---
     for (r, c), _violations in a.violations.items():

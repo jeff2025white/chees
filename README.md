@@ -127,7 +127,7 @@ vis = annotate(analysis, d)   # 新图，不改原图
 | 想改什么 | 去哪里 |
 |---|---|
 | 识别颜色 / 网格 | `recognize.py` 顶部常量、`find_grid()` |
-| 兵种推断 | `infer_pieces()`（仍偏标准开局） |
+| 兵种推断 | `infer_pieces()` + `piece_ocr` 单格墨迹模板（`piece_templates/{red,black}/`） |
 | 棋力 | `evaluate.py` PST；`search.py` 深度/剪枝；`book.py` |
 | 分析 UI | `ui/app.py` |
 | 对弈 UI / 难度 | `ui/play.py`（默认深度 6） |
@@ -144,6 +144,7 @@ python test/batch_run.py             # 批量识别+决策
 ## 已知限制
 
 - 兵种靠开局位置推断，中局区分车马炮兵能力弱。
+- 亮棕黑子与木纹难分；底线马位可用间隙修复补漏，中局仍可能漏检。
 - 棋盘靠棋子聚类拟合，大面积遮挡可能失败。
 - 纯 Python 搜索；深度 ≥8 时分析页预算很长，对弈页用更短预算保响应。
 - 截图按钮未实现。
