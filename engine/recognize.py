@@ -738,6 +738,14 @@ def analyze_image(path):
     img = cv2.imread(path)
     if img is None:
         raise RuntimeError(f"无法读取图片: {path}")
+    return analyze_array(img, path=path)
+
+
+def analyze_array(img, path="<memory>"):
+    """直接从内存中的 BGR ndarray 识别（不落盘）。
+
+    用于每秒帧的自动监听场景，避免频繁 I/O。
+    """
     h, w = img.shape[:2]
     y0, y1 = int(_ROI_Y0 * h), int(_ROI_Y1 * h)
     crop = img[y0:y1, 0:w]

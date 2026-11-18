@@ -33,7 +33,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from engine import decide_position
-from engine.recognize import analyze_image, annotate
+from engine.recognize import analyze_array, analyze_image, annotate
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 BG = "#1f2430"
@@ -208,6 +208,14 @@ class ChessApp:
         self._decision = None
         self._queue = queue.Queue()   # 工作线程 → 主线程 的结果通道
 
+        # ---- 自动监听模式 ----
+        self._auto_running = False
+        self._auto_thread = None
+        self._auto_stop = threading.Event()
+        self._computing = threading.Event()     # 计算中 → 暂停截图
+        self._last_grid_str = None               # 上一帧棋盘串（帧差）
+        self._target_hwnd = None                 # 找到的手游助手窗口句柄
+
         self._build_ui()
         self.root.bind("<Left>", lambda e: self.prev_image())
         self.root.bind("<Right>", lambda e: self.next_image())
@@ -263,7 +271,7 @@ class ChessApp:
         self.btn_play.pack(fill="x")
 
         self.btn_open = self._mk_button(right, "打开图片", self.open_image)
-        self.btn_shot = self._mk_button(right, "截图", self.capture_screen)
+        self.btn_shot = self._mk_button(right, "自动监听", self.toggle_auto_listen)
         self.btn_calc = self._mk_button(right, "计算", self.calculate)
 
         # 迭代深度拉杆
@@ -409,6 +417,218 @@ class ChessApp:
                           ("", f"{name}\n尺寸 {img.width}×{img.height}\n\n"),
                           ("", "点击「计算」识别局面并给出走位建议。")])
 
+    # --------------------------------------------------------- 自动监听
+    def toggle_auto_listen(self):
+        """切换自动监听模式：每秒截图 → 主将判断棋盘 → 帧差 → 自动计算。"""
+        if self._auto_running:
+            self.stop_auto_listen()
+        else:
+            self.start_auto_listen()
+
+    def start_auto_listen(self):
+        if sys.platform != "win32":
+            messagebox.showinfo("提示", "窗口截图目前仅支持 Windows。")
+            return
+        hwnds = _find_game_window("手游助手")
+        if not hwnds:
+            messagebox.showwarning(
+                "未找到窗口",
+                "没有找到标题包含「手游助手」的窗口。\n请先启动手游助手并打开象棋游戏。",
+            )
+            return
+        hwnd = hwnds[0]
+        try:
+            _bring_to_front(hwnd)
+        except OSError as exc:
+            messagebox.showerror("置前失败", str(exc))
+            return
+        self._target_hwnd = hwnd
+        self._auto_running = True
+        self._auto_stop.clear()
+        self._last_grid_str = None
+        self._computing.clear()
+        # UI 切换
+        self.btn_shot.configure(text="停止监听", activebackground="#ff6b6b")
+        self.btn_open.configure(state="disabled")
+        self.btn_calc.configure(state="disabled")
+        self._write_info([
+            ("head", "自动监听中\n"),
+            ("", "每秒截图一次，主将判断棋盘，帧差触发计算。\n"),
+            ("", "点击「停止监听」退出。\n\n"),
+            ("warn", "首次截图需要窗口完全渲染，约 1 秒后开始。"),
+        ])
+        # 等前台渲染就绪再开循环
+        self.root.after(500, self._spawn_auto_thread)
+
+    def _spawn_auto_thread(self):
+        if not self._auto_running:
+            return
+        self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
+        self._auto_thread.start()
+
+    def stop_auto_listen(self):
+        """停止自动监听。"""
+        self._auto_running = False
+        self._auto_stop.set()
+        self._computing.set()          # 如果卡在计算等待，解除阻塞让循环退出
+        self.btn_shot.configure(text="自动监听", activebackground=ACCENT)
+        self.btn_open.configure(state="normal")
+        self.btn_calc.configure(state="normal")
+        self._write_info([("head", "已停止自动监听\n")])
+
+    def _auto_loop(self):
+        """后台线程：每秒截图 → 识别 → 主将判断棋盘 → 帧差 → 触发计算。"""
+        import ctypes
+        import numpy as np
+
+        # 首次启动后等窗口稳定，再截第 1 帧
+        time.sleep(0.3)
+
+        while not self._auto_stop.is_set():
+            # 计算中 → 暂停截图，每 200ms 轮询一次
+            while self._computing.is_set():
+                if self._auto_stop.is_set():
+                    break
+                time.sleep(0.2)
+            if self._auto_stop.is_set():
+                break
+
+            # 窗口有效性检查
+            if not ctypes.windll.user32.IsWindow(self._target_hwnd):
+                self.root.after(0, self._auto_window_lost)
+                return
+
+            # 截图（内存中 PIL → BGR ndarray，不落盘）
+            try:
+                pil_img = _capture_window_client(self._target_hwnd)
+            except Exception as exc:                      # noqa: BLE001
+                self.root.after(0, lambda: self._auto_status(f"截图失败：{exc}"))
+                time.sleep(1.0)
+                continue
+            frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+            # 识别
+            try:
+                analysis = analyze_array(frame, path="<auto>")
+            except Exception as exc:                      # noqa: BLE001
+                self.root.after(0, lambda: self._auto_status(f"识别异常：{exc}"))
+                time.sleep(1.0)
+                continue
+
+            # 主将判断：同时有红帅 K 和黑将 k → 有棋盘
+            grid_str = analysis.grid_str
+            has_board = ("K" in grid_str) and ("k" in grid_str)
+            r_cnt = sum(1 for row in analysis.grid for ch in row if ch in "RNBAKCP")
+            b_cnt = sum(1 for row in analysis.grid for ch in row
+                        if ch.islower() and ch != ".")
+
+            if not has_board:
+                # 无棋盘（首页/结算页等）→ 不触发计算，继续等下一帧
+                self.root.after(0, lambda: self._auto_status(
+                    f"[{time.strftime('%H:%M:%S')}] 无棋盘（红{r_cnt}/黑{b_cnt}），跳过"))
+                self._last_grid_str = None
+                time.sleep(1.0)
+                continue
+
+            # 跟上次棋盘比
+            changed = (self._last_grid_str is not None) and (grid_str != self._last_grid_str)
+            first_time = (self._last_grid_str is None)
+
+            # 首次 or 变化 → 先显示原始帧（不等计算）
+            if first_time or changed:
+                self.root.after(0, lambda p=pil_img: self._auto_show_raw(p))
+
+            if first_time:
+                self.root.after(0, lambda: self._auto_status(
+                    f"[{time.strftime('%H:%M:%S')}] 有棋盘 红{r_cnt}/黑{b_cnt}，首次触发计算"))
+            elif changed:
+                self.root.after(0, lambda: self._auto_status(
+                    f"[{time.strftime('%H:%M:%S')}] 有棋盘 红{r_cnt}/黑{b_cnt}，局面变化 → 触发计算"))
+            else:
+                self.root.after(0, lambda: self._auto_status(
+                    f"[{time.strftime('%H:%M:%S')}] 有棋盘 红{r_cnt}/黑{b_cnt}，局面未变"))
+
+            # 首次 or 变化 → 清空旧日志 + 触发计算；算完自动覆盖为标注图
+            if first_time or changed:
+                self._last_grid_str = grid_str
+                self._computing.set()     # 计算期间暂停截图
+                self._busy = True         # 让轮询保持运行
+                self.root.after(0, self._auto_clear)   # 新计算先清旧日志
+                self.root.after(80, self._poll_result)
+                # 保存当前帧（标注输出用）
+                save_folder = os.path.join(_ROOT, "images")
+                os.makedirs(save_folder, exist_ok=True)
+                save_name = time.strftime("auto_%Y%m%d_%H%M%S") + ".png"
+                save_path = os.path.join(save_folder, save_name)
+                pil_img.save(save_path)
+
+                depth = self.depth_var.get()
+                threading.Thread(
+                    target=self._auto_calc_worker,
+                    args=(save_path, analysis, depth),
+                    daemon=True,
+                ).start()
+
+            # 等满 1 秒再截下一帧
+            self._auto_stop.wait(1.0)
+
+    def _auto_calc_worker(self, save_path, analysis, max_depth):
+        """自动模式下的计算 worker：完成后恢复截图循环。"""
+        try:
+            # 用已经识别好的 analysis 直接算，不用再识别
+            time_limit = min(90.0, max(4.0, 2.5 * (3 ** (max_depth - 4))))
+            decision = decide_position(
+                grid=analysis.grid_str,
+                side=analysis.view_side,
+                view_side=analysis.view_side,
+                time_limit=time_limit,
+                max_depth=max_depth,
+                top_n=0,
+            )
+            vis = annotate(analysis, decision)
+            pil = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+            self._queue.put((analysis, decision, pil, None, time_limit))
+        except Exception as exc:                      # noqa: BLE001
+            self._queue.put((None, None, None, exc, None))
+        finally:
+            self._computing.clear()    # 解除截图暂停
+
+    def _auto_show_raw(self, pil_img):
+        """主线程：显示原始帧（不等计算完成）。"""
+        self.base_image = pil_img
+        self._render()
+
+    def _auto_clear(self):
+        """自动模式：清空日志（新计算开始前调用）。"""
+        self.info.configure(state="normal")
+        self.info.delete("1.0", "end")
+        self.info.configure(state="disabled")
+
+    def _auto_append(self, parts):
+        """自动模式：追加若干行到日志末尾，不覆盖历史；自动滚动到底。"""
+        self.info.configure(state="normal")
+        for tag, text in parts:
+            self.info.insert("end", text, tag or "")
+        # 限制日志最多 500 行，超过就删旧行防止无限膨胀
+        total = int(self.info.index("end-1c").split(".")[0])
+        if total > 500:
+            self.info.delete("1.0", f"{total - 500}.0")
+        self.info.see("end")
+        self.info.configure(state="disabled")
+
+    def _auto_status(self, msg):
+        """自动模式：追加一行状态（简化版日志）。"""
+        self._auto_append([("", msg + "\n")])
+
+    def _auto_window_lost(self):
+        self.stop_auto_listen()
+        self._write_info([
+            ("warn", "目标窗口已关闭\n"),
+            ("", "手游助手窗口消失，自动监听停止。\n"
+                 "窗口句柄：" + str(self._target_hwnd)),
+        ])
+        messagebox.showwarning("窗口丢失", "手游助手窗口已关闭，自动监听停止。")
+
     def open_play(self):
         """另开人机对弈窗口（与本窗并存）。"""
         script = os.path.join(_HERE, "play.py")
@@ -494,17 +714,24 @@ class ChessApp:
         self._calc_done(analysis, decision, pil, error)
 
     def _calc_done(self, analysis, decision, pil, error):
+        auto_mode = self._auto_running
         self._busy = False
-        self.btn_calc.configure(state="normal", text="计算")
+        if not auto_mode:
+            self.btn_calc.configure(state="normal", text="计算")
 
         img_name = os.path.basename(self.current_path or "")
         if error is not None:
-            self._write_info([
-                ("warn", "计算失败\n"),
-                ("", f"图片：{img_name}\n"),
-                ("", str(error)),
-            ])
-            messagebox.showerror("计算失败", str(error))
+            if auto_mode:
+                self._auto_append([
+                    ("warn", f"计算失败：{error}\n"),
+                ])
+            else:
+                self._write_info([
+                    ("warn", "计算失败\n"),
+                    ("", f"图片：{img_name}\n"),
+                    ("", str(error)),
+                ])
+                messagebox.showerror("计算失败", str(error))
             return
 
         self._analysis = analysis
@@ -521,44 +748,79 @@ class ChessApp:
         turn = inp.get("side_to_move", "red")
         turn_txt = "红方行棋" if turn == "red" else "黑方行棋"
 
-        lines = [
-            ("head", "当前图片\n"),
-            ("", f"{img_name}\n\n"),
-            ("head", "识别结果\n"),
-            ("", f"红{analysis.red_count}/黑{analysis.black_count} · {side_txt}（我方）"
-                 f" · {turn_txt} · 命中{analysis.hit}\n\n"),
-            ("head", "推演序列\n"),
-        ]
-
         best = decision.get("best_move")
-        if best:
-            names = pv.get("chinese") or []
-            sides = pv.get("sides") or []
-            scores = pv.get("scores") or []
-            if names:
-                for i, name in enumerate(names):
-                    who = "我方" if (i < len(sides) and sides[i] == our_side) else "对方"
-                    score = scores[i] / 100.0 if i < len(scores) else 0.0
-                    tag = "move" if who == "我方" else "opp"
-                    lines.append((tag, f"{i + 1:>2}.{name} {who} {score:+.2f}\n"))
-            else:
-                who = "我方" if best.get("color") == our_side else "对方"
-                tag = "move" if who == "我方" else "opp"
-                lines.append((tag, f"{best['chinese']}  {who}  {best['iccs']}\n"))
 
-            lines.append(("", f"\n最终评价 {best['score_text']}"
-                              f"{'  · 将军' if best.get('gives_check') else ''}"
-                              f"{'  · 绝杀' if best.get('is_mate') else ''}\n"))
-            src = "开局库+" if search_info.get("book") else ""
-            lines.append(("", f"{src}深度 {search_info.get('depth', 0)} 层"
-                              f" · 推演 {len(pv.get('chinese') or [])} 步"
-                              f" · {search_info.get('nodes', 0):,} 节点"
-                              f" · {search_info.get('time_ms', 0) / 1000:.1f}s\n"))
-            if best.get("reason"):
-                lines.append(("", f"{best['reason']}\n"))
+        if auto_mode:
+            # 自动模式 → 追加到日志末尾，不清空
+            ts = time.strftime("%H:%M:%S")
+            block = [
+                ("head", f"── [{ts}] 局面分析 ──\n"),
+                ("", f"红{analysis.red_count}/黑{analysis.black_count}"
+                     f" · {side_txt}（我方） · {turn_txt}\n"),
+                ("head", "推演序列\n"),
+            ]
+            if best:
+                names = pv.get("chinese") or []
+                sides = pv.get("sides") or []
+                scores = pv.get("scores") or []
+                if names:
+                    for i, name in enumerate(names):
+                        who = "我方" if (i < len(sides) and sides[i] == our_side) else "对方"
+                        score = scores[i] / 100.0 if i < len(scores) else 0.0
+                        tag = "move" if who == "我方" else "opp"
+                        block.append((tag, f"{i + 1:>2}.{name} {who} {score:+.2f}\n"))
+                else:
+                    who = "我方" if best.get("color") == our_side else "对方"
+                    tag = "move" if who == "我方" else "opp"
+                    block.append((tag, f"{best['chinese']}  {who}  {best['iccs']}\n"))
+                block.append(("", f"\n评价 {best['score_text']}"
+                                  f"{' · 将' if best.get('gives_check') else ''}"
+                                  f"{' · 杀' if best.get('is_mate') else ''}\n"))
+                src = "开局库+" if search_info.get("book") else ""
+                block.append(("", f"{src}深度{search_info.get('depth', 0)}"
+                                  f" · {search_info.get('nodes', 0):,}节点"
+                                  f" · {search_info.get('time_ms', 0) / 1000:.1f}s\n"))
+            else:
+                block.append(("warn", decision.get("message", "没有可走的着法")))
+            self._auto_append(block)
         else:
-            lines.append(("warn", decision.get("message", "没有可走的着法")))
-        self._write_info(lines)
+            # 手动模式 → 全量重写（保持原样）
+            lines = [
+                ("head", "当前图片\n"),
+                ("", f"{img_name}\n\n"),
+                ("head", "识别结果\n"),
+                ("", f"红{analysis.red_count}/黑{analysis.black_count} · {side_txt}（我方）"
+                     f" · {turn_txt} · 命中{analysis.hit}\n\n"),
+                ("head", "推演序列\n"),
+            ]
+            if best:
+                names = pv.get("chinese") or []
+                sides = pv.get("sides") or []
+                scores = pv.get("scores") or []
+                if names:
+                    for i, name in enumerate(names):
+                        who = "我方" if (i < len(sides) and sides[i] == our_side) else "对方"
+                        score = scores[i] / 100.0 if i < len(scores) else 0.0
+                        tag = "move" if who == "我方" else "opp"
+                        lines.append((tag, f"{i + 1:>2}.{name} {who} {score:+.2f}\n"))
+                else:
+                    who = "我方" if best.get("color") == our_side else "对方"
+                    tag = "move" if who == "我方" else "opp"
+                    lines.append((tag, f"{best['chinese']}  {who}  {best['iccs']}\n"))
+
+                lines.append(("", f"\n最终评价 {best['score_text']}"
+                                  f"{'  · 将军' if best.get('gives_check') else ''}"
+                                  f"{'  · 绝杀' if best.get('is_mate') else ''}\n"))
+                src = "开局库+" if search_info.get("book") else ""
+                lines.append(("", f"{src}深度 {search_info.get('depth', 0)} 层"
+                                  f" · 推演 {len(pv.get('chinese') or [])} 步"
+                                  f" · {search_info.get('nodes', 0):,} 节点"
+                                  f" · {search_info.get('time_ms', 0) / 1000:.1f}s\n"))
+                if best.get("reason"):
+                    lines.append(("", f"{best['reason']}\n"))
+            else:
+                lines.append(("warn", decision.get("message", "没有可走的着法")))
+            self._write_info(lines)
 
     # --------------------------------------------------------------- 工具
     def _write_info(self, parts):
@@ -585,6 +847,11 @@ def main():
     _enable_dpi_awareness()
     root = tk.Tk()
     app = ChessApp(root)
+
+    def on_close():
+        app.stop_auto_listen()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_close)
 
     def report_size():
         root.update_idletasks()

@@ -124,12 +124,15 @@ type : KING=1, ADVISOR=2, ELEPHANT=3, HORSE=4, CHARIOT=5, CANNON=6, PAWN=7
 
 ```python
 class Board:
-    __slots__ = ("cells", "turn", "undo_stack", "hash_stack", "kings")
+    __slots__ = ("cells", "turn", "undo_stack", "hash_stack", "kings",
+                 "piece_count", "base_score")
     cells: List[int]       # 长度 90 的一维数组
     turn: int              # RED=0 或 BLACK=1
-    undo_stack: List       # [(move, captured, hash_after), ...]
+    undo_stack: List       # [(move, captured, hash_after), ...]；空着 move=None
     hash_stack: List       # Zobrist 哈希历史，用于重复局面检测
     kings: List[int]       # [红帅sq, 黑将sq]，-1 表示不在棋盘上
+    piece_count: int       # 当前棋子数，走子/撤销时增量维护
+    base_score: int        # 子力+PST+深入惩罚，走子/撤销时增量维护
 ```
 
 ### 2.3 Zobrist 哈希
@@ -158,18 +161,20 @@ undo 不需要重新算哈希——直接从 `hash_stack.pop()` 恢复。
 
 ```python
 apply(move) → captured_piece
-  # 1. cells[to] 吃走 captured
+  # 1. 增量更新 Zobrist、base_score；有吃子时更新 piece_count
   # 2. cells[frm] → EMPTY, cells[to] → piece
   # 3. 若 piece 是将/帅 → 更新 kings 缓存
   # 4. turn 翻转
   # 5. push undo_stack + hash_stack
 
+apply_null()
+  # 空着剪枝专用：棋子不动，只翻转 turn、更新哈希并保存撤销信息
+
 undo()
-  # 1. cells[to] → cells[frm]（棋子退回）
-  # 2. cells[frm] → captured（被吃子复活）
-  # 3. 若退回的是将/帅 → 更新 kings
-  # 4. turn 翻转
-  # 5. pop undo_stack + hash_stack
+  # 1. cells[frm] → piece（棋子退回），cells[to] → captured（被吃子复活）
+  # 2. 恢复 base_score / piece_count；若退回的是将/帅 → 更新 kings
+  # 3. turn 翻转，pop undo_stack + hash_stack
+  # 4. 若撤销的是空着，只恢复 turn 与哈希栈
 ```
 
 ### 2.5 FEN / Grid 解析
@@ -679,3 +684,223 @@ decide.py   ← 顶层入口 decide_position
     ↑
 ui/app.py（截图分析）  ui/play.py（人机对弈）
 ```
+
+---
+
+## 12. 当前人机对弈计算链与约 10 秒耗时分析（2026-11-18）
+
+### 12.1 结论先行
+
+1. **人机对弈默认“深度 6”是最大迭代深度，不是保证完成 6 层。** 引擎从 1 层开始逐层加深，并根据剩余时间和上一层耗时决定是否继续。
+2. `ui/play.py` 在深度 6 时传入的搜索预算是 **7.5 秒**，不是固定每次计算 10 秒。实际墙钟时间还包含合法性检查、开局库、结果解释、坐标转换、线程排队与界面刷新，并受超时检测粒度和系统调度影响。
+3. 2026-11-18 已编译 `engine/_xiangqi.cp310-win_amd64.pyd`，复测 `native_available=True`。默认 `search()` 现在优先走 **`engine._xiangqi` Cython 原生核**；只有扩展不存在或无法导入的环境才回退到 `search_python()`。已经运行的旧界面需要重启后才能加载新扩展。
+4. 对弈路径明确设置 `top_n=0, fill_pv=False`，因此**不做备选着法复核、不启用吃子/布局软偏好，也不为补全长主变额外续搜**。主要耗时在 Negamax + 静态搜索的节点展开，而不是界面绘图。
+5. 开局库命中时对弈路径直接返回库着法，可能接近瞬时；脱库后的复杂中局更可能用满搜索预算。因此“每次约 10 秒”应理解为当前一批局面的体感范围，不是所有局面的固定耗时。
+
+### 12.2 从玩家落子到电脑落子的完整流程
+
+```text
+玩家在 ui/play.py 点击合法落点
+  │
+  ├─ generate_legal() 校验玩家着法
+  ├─ Board.apply() 执行玩家着法
+  ├─ game_status() 检查将军、绝杀、困毙
+  └─ _start_engine() 保存当前 FEN 和深度，启动后台线程
+          │
+          ▼
+      _engine_worker(fen, max_depth)
+          │
+          ├─ time_limit = min(30, max(2.5, 1.2 × 2.5^(max_depth-4)))
+          └─ decide_position(
+                 fen=fen, side="black", view_side="red",
+                 max_depth=max_depth, time_limit=time_limit,
+                 top_n=0, fill_pv=False)
+                  │
+                  ├─ Board.from_fen() 重建局面
+                  ├─ game_status() 生成当前合法着法并判断状态
+                  ├─ lookup_book() 查开局库
+                  │    └─ 命中且 fill_pv=False：直接用库，不续搜
+                  └─ 未命中：search()
+                           │
+                           ├─ 有 engine._xiangqi：Cython 原生核（当前实际路径）
+                           └─ 无扩展：search_python()（自动回退）
+                                    │
+                                    ├─ 迭代加深 + aspiration
+                                    ├─ Negamax + alpha-beta
+                                    ├─ TT / 空着剪枝 / LMR
+                                    ├─ 静态搜索与评估
+                                    └─ 返回最后一个完整深度的最佳着法
+                  │
+                  ├─ extract_pv(fill=False)：只沿 TT 取已有主变
+                  ├─ _move_payload()：中文记谱、战术解释、评分与坐标
+                  └─ _pv_payload()：校验并转换已有 PV
+          │
+          ▼
+      queue.Queue → Tk 主线程每 80ms 轮询
+          │
+          ├─ 再次校验电脑着法合法
+          ├─ Board.apply() 执行黑方着法
+          └─ 重画棋盘并检查游戏状态
+```
+
+后台线程只负责计算，Tk 控件仍在主线程更新。因此计算期间界面不至于因搜索递归直接卡死，但电脑要等结果入队后才会落子。
+
+### 12.3 难度、时间预算与实际深度的关系
+
+对弈页难度范围为 2～12，默认 6。时间预算公式位于 `ui/play.py::_engine_worker`：
+
+| 设置深度 | 搜索时间预算 | 说明 |
+|---:|---:|---|
+| 2～4 | 2.5 秒 | 下限保护 |
+| 5 | 3.0 秒 | `1.2 × 2.5` |
+| 6 | 7.5 秒 | 当前默认值 |
+| 7 | 18.75 秒 | 预算明显增长 |
+| 8～12 | 30 秒 | 达到封顶 |
+
+每一层开始前还有独立的“是否值得继续加深”判断：
+
+```python
+if last_duration and elapsed + last_duration * 3.0 > time_limit:
+    break
+```
+
+这表示：
+
+- 预算只是允许搜索使用的上限，不保证一定用完；
+- 如果上一层已经较贵，引擎可能提前停止，最终深度小于界面设置；
+- 如果下一层已经开始，之后主要靠递归内的超时检查退出；
+- 超时后丢弃未完成层，使用**上一个完整深度**的最佳着法；连 1 层都未完成时才退化为第一个合法着法。
+
+### 12.4 一次搜索内部具体算了什么
+
+#### A. 迭代加深与 aspiration
+
+从深度 1 搜到 `max_depth`。上一轮最佳着法会进入下一轮根节点排序，置换表也会保留较浅层结果，虽然浅层需要重复计算，但通常能显著提高深层剪枝效率。
+
+深度 3 起使用上一轮评分上下各 60 厘兵的 aspiration 窗口。若失败低/失败高，窗口按 60、120、240……扩宽并重搜；评分波动大时，这部分重搜会增加节点数。
+
+#### B. Negamax + alpha-beta
+
+双方轮流行棋，通过 `-negamax(...)` 交替取负统一评分视角。每个节点的主要工作为：
+
+1. 重复局面检测，重复则按 0 分处理；
+2. 查询 2²⁰ 槽的定长置换表，满足深度和边界条件时直接复用；
+3. 判断是否被将军；
+4. 合适时做空着剪枝：深度至少 3，削减 2 层，深度至少 6 时削减 3 层；
+5. 生成并排序合法着法；
+6. 逐个 `apply → 递归 → undo`；
+7. 对靠后的安静着法执行 LMR，若减层搜索反而提高 alpha，再按原深度重搜；
+8. 把评分边界和最佳着法写回置换表。
+
+根节点会扫描当前窗口下的根着法并保存本轮结果；`top_n=0` 时最终只保留最佳着法，不对其他根着法做完整窗口复核。
+
+#### C. 着法排序
+
+当前优先级为：
+
+```text
+TT 最佳着法
+  > 吃子（MVV-LVA + 轻量 SEE）
+  > 两个杀手着法
+  > 历史启发表
+```
+
+开局阶段，车/马/炮深入对方底三行吃子会被降低排序分，其中炮额外降 60000，其他两者降 40000。该规则只改变搜索顺序；对弈路径 `top_n=0` 不会在搜索结束后再用软偏好替换最佳着法。
+
+#### D. 静态搜索与评估
+
+主搜索深度归零后不是立刻采用静态分，而是进入 `quiesce()`：
+
+- 普通局面只展开吃子，并使用差值剪枝；
+- 被将军时展开全部合法应着，没有应着则按杀棋计分；
+- 普通局面的递归上限为 `max_depth+2`，被将军时为 `max_depth+4`。
+
+所以界面显示深度 6 时，战术分支可能继续向下展开，实际节点数不只由“6 层”决定。
+
+静态评估由两部分组成：
+
+1. `Board.base_score` 增量维护的子力、位置表和深入惩罚；
+2. 每次评估扫描棋盘补算的开局出子、士象防守、车炮控线等着法环境分。
+
+### 12.5 时间主要花在哪里
+
+| 阶段 | 当前是否执行 | 成本特征 |
+|---|---|---|
+| FEN 解析、合法着法与状态检查 | 每次执行 | 通常远小于主搜索 |
+| 开局库查询 | 每次执行 | 字典查询；命中时对弈路径可省掉整个搜索 |
+| 迭代加深主搜索 | 脱库后执行 | **主要耗时**，节点数随局面和剪枝效率变化 |
+| 合法着法生成与攻击检测 | 每个搜索节点反复执行 | 高频热点；native 可显著降低单节点成本 |
+| `apply/undo`、哈希、增量评分 | 每个展开节点执行 | 高频小操作累积 |
+| 静态评估与吃子排序 | 叶子及吃子节点执行 | 战术局面会明显放大 |
+| 备选着法复核 | 对弈不执行 | `top_n=0` 已跳过 |
+| PV 断断续搜 | 对弈不执行 | `fill_pv=False` 已跳过，也无额外 0.8 秒续搜窗口 |
+| 已有 PV 提取、中文解释和记谱 | 每次执行 | 通常很小，但包含合法性检查与棋盘推演 |
+| 队列轮询与界面刷新 | 每次执行 | 轮询间隔 80ms，绘图通常不是主要成本 |
+
+### 12.6 本机独立测量：Python 基线与 native 复测
+
+为隔离开局库影响，2026-11-18 在当前工作区直接调用 `search()`，使用与对弈默认档一致的 `time_limit=7.5, max_depth=6, top_n=0, fill_pv=False`，局面为红方炮二平五后轮到黑方。
+
+编译扩展前的纯 Python 基线：
+
+```text
+native_available = False
+wall_s             = 3.410
+engine_ms          = 3409
+最终完整深度        = 5
+nodes              = 37,990
+平均速度            = 约 11,142 nodes/s
+PV 长度            = 5
+```
+
+同一局面、同一入口和同一参数，编译扩展后的 native 复测：
+
+```text
+native_available = True
+wall_s             = 0.113
+engine_ms          = 111
+最终完整深度        = 6
+nodes              = 92,872
+平均速度            = 约 818,354 nodes/s
+PV 长度            = 6
+```
+
+两次完成的深度和节点数不同，不能直接把 `3.410 / 0.113` 当作等深度加速比。固定深度 4 的 `test/bench_native.py` 对照结果如下：
+
+```text
+Python    2.754s   nodes=21,789   move=(64,65)   score=0
+Native    0.030s   nodes=21,084   move=(64,65)   score=0
+加速约 92.9 倍，最佳着法与评分一致
+```
+
+这些结果说明：
+
+1. **设置深度 6 不等于一定完成深度 6**；纯 Python 基线因继续加深预估超预算而停在深度 5。
+2. **7.5 秒是预算而不是固定等待时间**；native 在本例完成深度 6 后便立即返回，没有继续等待到预算上限。
+3. 当前默认 native 路径已显著降低该样例的计算时间，同时保持固定深度对照中的最佳着法和评分一致。
+
+### 12.7 如何理解此前“一次约 10 秒”
+
+在纯 Python 路径下，默认档搜索预算为 7.5 秒，复杂中局可能接近或用满预算；此外还有以下非固定差额：
+
+- 每 512 个节点才检查一次时钟，超时后还要沿递归栈退出；
+- 搜索前的状态检查，以及搜索后的解释、PV 校验、坐标和记谱转换，发生在 `Searcher.start` 的纯搜索计时之外；
+- 后台线程结果最多等待下一次 80ms UI 轮询；
+- 搜索进程与模拟器等其他进程同时运行时，CPU 调度会改变单位时间节点数和超时检测粒度对应的墙钟时间，纯 Python 路径尤其明显。
+
+启用 native 后，上述默认深度样例已不再需要用完预算。**如果重启界面后仍稳定耗时约 10 秒，就不能继续笼统归因于搜索速度**，应记录以下阶段时间戳：
+
+```text
+玩家落子完成时刻 → worker 进入时刻 → decide_position 返回时刻
+→ UI 收到结果时刻 → 电脑落子绘制完成时刻
+```
+
+并与返回值 `decision["search"]` 中的 `time_ms / depth / nodes / book` 对照。`time_ms` 主要反映搜索会话，不等于玩家感受到的全部墙钟时间；更深难度或更复杂局面仍可能合法地使用更多预算。
+
+### 12.8 native 运行与后续调速注意事项
+
+- 当前扩展已编译，`native_available()` 和 `engine._xiangqi.native_available()` 均返回 `True`，默认 `search()` 自动进入原生核。
+- 已打开的 `ui/play.py` / `ui/app.py` 在编译前就完成了模块导入，需要**重启界面**才能加载新扩展。
+- `.pyd` 是本地构建产物且被 `.gitignore` 排除；更换机器、Python 版本或拉取全新代码目录后，需要重新执行 `python setup.py build_ext --inplace`。
+- 想直接缩短高难度的最长等待：降低对弈页难度，或调整 `ui/play.py` 的 `time_limit` 公式；深度 5 当前预算为 3 秒。
+- 修改 Cython 源码后，应重新编译，并运行 `python test/bench_native.py --depth 4` 与 `python test/test_xiangqi_engine.py`，检查加速效果、结果一致性和规则回归。

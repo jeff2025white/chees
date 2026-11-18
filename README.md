@@ -20,9 +20,9 @@ python -m engine          # 引擎命令行
 
 **macOS 注意**：系统自带 `/usr/bin/python3` 的 Tcl/Tk 8.5 在新系统上会**整窗白屏**。请安装 Homebrew 的 `python-tk`（如 `brew install python@3.14 python-tk@3.14`）。`ui/play.py` / `ui/app.py` 检测到旧 Tk 时会自动切到 `/opt/homebrew/bin/python3*`。
 
-### 可选：Cython 搜索核（大幅加速算棋）
+### Cython 搜索核（编译后默认优先，大幅加速算棋）
 
-未编译时自动回退纯 Python，功能不变。编译后 `search()` 走 `engine._xiangqi`。
+编译后 `search()` 默认优先走 `engine._xiangqi`，`native_available()` 返回 `True`；仅在扩展未编译或无法导入时自动回退纯 Python，功能不变。已经运行的界面需重启才能加载新编译的扩展。
 
 ```bash
 pip install 'Cython>=3.0'
@@ -163,5 +163,5 @@ python test/batch_run.py             # 批量识别+决策
 - 兵种：近开局位置种子 + 单格墨迹模板（NCC，含小范围平移）；跳马后不再误补底线假马。
 - 亮棕黑子与木纹难分；底线马位可用间隙修复补漏（已跳出则跳过），中局仍可能漏检。
 - 棋盘靠棋子聚类拟合，大面积遮挡可能失败。
-- 纯 Python 搜索；深度 ≥8 时分析页预算很长，对弈页用更短预算保响应。
+- 搜索默认优先使用已编译的 Cython 原生核，未编译时回退纯 Python；深度 ≥8 时分析页预算很长，对弈页用更短预算保响应。
 - 截图按钮仅支持 Windows：置前标题含「手游助手」的窗口后按客户区截屏。
