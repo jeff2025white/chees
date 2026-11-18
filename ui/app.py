@@ -570,6 +570,10 @@ class ChessApp:
 
 
 def main():
+    from tk_boot import reexec_with_modern_tk_if_needed
+
+    reexec_with_modern_tk_if_needed(__file__)
+
     # 人机对弈进行中时不要抢焦点弹出截图分析窗；
     # 对弈页「截图分析」按钮会带 CHEES_ALLOW_WITH_PLAY=1 显式放行。
     play_lock = os.path.join(_ROOT, ".play_session.lock")

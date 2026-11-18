@@ -11,13 +11,14 @@ col 向右递增、row 向下递增，row 9 为我方（图下方）底线。
 from .board import Board
 from .decide import decide_position, explain_position
 from .notation import chinese_notation, move_to_iccs, move_to_ucci
-from .search import search
+from .search import native_available, search
 
 __all__ = [
     "Board",
     "decide_position",
     "explain_position",
     "search",
+    "native_available",
     "chinese_notation",
     "move_to_iccs",
     "move_to_ucci",

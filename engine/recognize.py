@@ -77,12 +77,25 @@ def _cell_color(rr, br, oran=0.0):
     return "."
 
 
+def _horse_already_developed(grid, r, c, marker):
+    """马位 (r,c) 是否已有同色子落在马的日字跳点上（说明马已跳出，勿补漏）。"""
+    for dr, dc in ((-2, -1), (-2, 1), (2, -1), (2, 1),
+                   (-1, -2), (-1, 2), (1, -2), (1, 2)):
+        rr, cc = r + dr, c + dc
+        if 0 <= rr < ROWS and 0 <= cc < COLS and grid[rr][cc] == marker:
+            return True
+    return False
+
+
 def _repair_backrow_horse_gaps(grid):
     """补回底线漏检的马位（col 1 / 7）。
 
     亮棕黑子常在 HSV 上与棋盘木纹不可分，连通域与格心 mask 都会漏。
     若某一行已有 ≥7 枚同色子且马位为空、左右邻为该色，则补上。
     只动 row 0-2 / 7-9，避免中局误补。
+
+    若该马位的日字跳点上已有同色子，视为马已跳出，禁止补假马——
+    否则会占掉 n/N 配额，把真马 OCR 成车（见 20261118 跳马局）。
     """
     for r in (0, 1, 2, 7, 8, 9):
         row = grid[r]
@@ -99,6 +112,8 @@ def _repair_backrow_horse_gaps(grid):
             continue
         for c in (1, 7):
             if row[c] != ".":
+                continue
+            if _horse_already_developed(grid, r, c, maj):
                 continue
             left = row[c - 1] if c - 1 >= 0 else "."
             right = row[c + 1] if c + 1 < COLS else "."
@@ -137,7 +152,24 @@ def detect_pieces(crop):
         rp = float(red_mask[y0:y1, x0:x1].mean())
         bp = float(black_mask[y0:y1, x0:x1].mean())
         pieces.append((float(cx), float(cy), "R" if rp > bp else "B", float(area)))
-    return pieces
+    return _nms_pieces(pieces, min_dist=28 * scale)
+
+
+def _nms_pieces(pieces, min_dist: float):
+    """合并碎裂连通域：同色且中心距 < min_dist 时保留面积更大者。"""
+    if len(pieces) <= 1:
+        return pieces
+    order = sorted(range(len(pieces)), key=lambda i: -pieces[i][3])
+    kept = []
+    for i in order:
+        cx, cy, color, area = pieces[i]
+        if any(
+            color == kc and (cx - kx) ** 2 + (cy - ky) ** 2 < min_dist * min_dist
+            for kx, ky, kc, _a in kept
+        ):
+            continue
+        kept.append(pieces[i])
+    return kept
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +226,9 @@ def find_grid(crop, pieces=None):
 
     先用棋子坐标聚类估计格宽，再在「哪一簇对应第几行/第几列」上做轴向评分，
     只有几百次评估（早期版本用全图四重暴力搜索，耗时几十秒）。
+
+    残局棋子少时，相邻占用行间距常是 2～3 格，中位间距会把 cell 估大、
+    网格整体上移（底线棋子落到盘外）。此时锁定默认格宽再搜原点。
     """
     if pieces is None:
         pieces = detect_pieces(crop)
@@ -213,17 +248,26 @@ def find_grid(crop, pieces=None):
     ys = [p[1] for p in core]
     xs = [p[0] for p in core]
 
-    # 格宽候选：优先用聚类间距中位数
-    diffs = []
-    if len(rows) >= 2:
-        diffs.extend(np.diff(rows).tolist())
-    if len(cols) >= 2:
-        diffs.extend(np.diff(cols).tolist())
-    base_cell = float(np.median(diffs)) if diffs else default_cell
-    if not (0.72 * default_cell <= base_cell <= 1.35 * default_cell):
+    # 格宽候选：只用「约 1 格」的间距；跨多行的空档不参与估宽
+    near = []
+    for seq in (rows, cols):
+        if len(seq) < 2:
+            continue
+        for d in np.diff(seq):
+            if 0.85 * default_cell <= d <= 1.15 * default_cell:
+                near.append(float(d))
+    sparse = len(core) < 16
+    if sparse or not near:
         base_cell = default_cell
+    else:
+        base_cell = float(np.median(near))
+        if not (0.90 * default_cell <= base_cell <= 1.10 * default_cell):
+            base_cell = default_cell
 
-    cell_list = [base_cell + d * scale for d in (-1.0, -0.5, 0.0, 0.5, 1.0)]
+    # 稀疏残局略放宽格宽微调，原点仍靠占用点对齐
+    deltas = (-1.0, -0.5, 0.0, 0.5, 1.0) if not sparse else (
+        -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0)
+    cell_list = [base_cell + d * scale for d in deltas]
     tol = 0.38 * base_cell
 
     def search_axis(values, centers, count):
@@ -256,7 +300,44 @@ def find_grid(crop, pieces=None):
         cell = cell_y
         s2, hit2 = _score_grid(core, row0, col0, cell_y, tol)
 
+    # 稀疏残局：若仍有棋子明显落在盘外，用固定默认格宽重搜原点
+    if sparse:
+        cell = default_cell
+        tol = 0.38 * cell
+        best = (hit2, s2, row0, col0)
+        for c in rows:
+            for k in range(ROWS):
+                r0 = float(c - k * cell)
+                if r0 < -2 or r0 + 9 * cell > h + 2:
+                    continue
+                for x in cols:
+                    for j in range(COLS):
+                        c0 = float(x - j * cell)
+                        if c0 < -2 or c0 + 8 * cell > w + 2:
+                            continue
+                        sc, ht = _score_grid(core, r0, c0, cell, tol)
+                        if ht > best[0] or (ht == best[0] and sc > best[1]):
+                            best = (ht, sc, r0, c0)
+        hit2, s2, row0, col0 = best
+
+    # 用已对齐的棋子反推原点，减小整体平移（透视/边距）
+    row0, col0 = _refine_grid_origin(core, row0, col0, cell)
+
     return row0, col0, cell, s2, hit2
+
+
+def _refine_grid_origin(pieces, row0, col0, cell):
+    """按最近格点反推 row0/col0，使格心更贴近棋子中心。"""
+    rs, cs = [], []
+    for cx, cy, _color, _area in pieces:
+        ci = int(round((cx - col0) / cell))
+        ri = int(round((cy - row0) / cell))
+        if 0 <= ci < COLS and 0 <= ri < ROWS:
+            cs.append(cx - ci * cell)
+            rs.append(cy - ri * cell)
+    if len(rs) < 3:
+        return row0, col0
+    return float(np.mean(rs)), float(np.mean(cs))
 
 
 # --------------------------------------------------------------------------

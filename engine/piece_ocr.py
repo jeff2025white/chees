@@ -100,6 +100,18 @@ def ncc(a: np.ndarray, b: np.ndarray) -> float:
     return float((af * bf).sum() / denom)
 
 
+def ncc_best(ink: np.ndarray, tmpl: np.ndarray, max_shift: int = 2) -> float:
+    """允许小范围平移后的最高 NCC，减轻格心/裁切偏差。"""
+    if max_shift <= 0:
+        return ncc(ink, tmpl)
+    pad = int(max_shift)
+    padded = cv2.copyMakeBorder(ink, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+    res = cv2.matchTemplate(
+        padded.astype(np.float32), tmpl.astype(np.float32), cv2.TM_CCOEFF_NORMED
+    )
+    return float(res.max())
+
+
 def extract_cell_ink(crop, red_mask, black_mask, cx, cy, cell, is_red):
     """格心墨迹 → 40×40 二值图；失败返回 None。"""
     h, w = crop.shape[:2]
@@ -136,13 +148,13 @@ def score_cell_types(ink, is_red, templates=None) -> dict:
     for ch in own:
         best = -1.0
         for tmpl in templates.get(ch, []):
-            best = max(best, ncc(ink, tmpl))
+            best = max(best, ncc_best(ink, tmpl))
         if best >= 0:
             scores[ch] = best
     for red_ch, blk_ch in _SHARED_PAIRS:
         mine, other = (red_ch, blk_ch) if is_red else (blk_ch, red_ch)
         for tmpl in templates.get(other, []):
-            scores[mine] = max(scores.get(mine, -1.0), ncc(ink, tmpl))
+            scores[mine] = max(scores.get(mine, -1.0), ncc_best(ink, tmpl))
     return scores
 
 
@@ -179,9 +191,13 @@ def position_type_bonus(r, c, ch, side, elephant_valid_fn):
     if ch in ("K", "k"):
         r0, r1 = ((7, 9) if (is_red == red_bottom) else (0, 2))
         bonus += 0.35 if (r0 <= r <= r1 and c in (3, 4, 5)) else -0.5
+        if r0 <= r <= r1 and c == 4:
+            bonus += 0.30  # 将/帅更常在九宫中线
     elif ch in ("A", "a"):
         r0, r1 = ((7, 9) if (is_red == red_bottom) else (0, 2))
         bonus += 0.25 if (r0 <= r <= r1 and c in (3, 4, 5)) else -0.35
+        if r0 <= r <= r1 and c in (3, 5):
+            bonus += 0.12  # 士位偏左右
     elif ch in ("B", "b"):
         valid = elephant_valid_fn(is_red, side)
         bonus += 0.35 if (r, c) in valid else -0.45
@@ -190,6 +206,9 @@ def position_type_bonus(r, c, ch, side, elephant_valid_fn):
         step = -1 if back == 9 else 1
         if r == back + 2 * step and c in (1, 7):
             bonus += 0.25
+        else:
+            # 非经典炮位抑制：残局马/车墨迹常被认成炮
+            bonus -= 0.12
     elif ch in ("P", "p"):
         back = 9 if (is_red == red_bottom) else 0
         step = -1 if back == 9 else 1
@@ -201,12 +220,20 @@ def position_type_bonus(r, c, ch, side, elephant_valid_fn):
             bonus += 0.15
     elif ch in ("N", "n"):
         back = 9 if (is_red == red_bottom) else 0
+        step = -1 if back == 9 else 1
         if r == back and c in (1, 7):
             bonus += 0.20
+        # 开局跳马常见落点：底线马位的日字前进格
+        if r == back + 2 * step and c in (0, 2, 6, 8):
+            bonus += 0.30
     elif ch in ("R", "r"):
         back = 9 if (is_red == red_bottom) else 0
         if r == back and c in (0, 8):
             bonus += 0.20
+        # 跳马落点上抑制「车」误抢（车马墨迹接近时）
+        step = -1 if back == 9 else 1
+        if r == back + 2 * step and c in (0, 2, 6, 8):
+            bonus -= 0.25
     return bonus
 
 

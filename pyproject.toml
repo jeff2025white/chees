@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "Cython>=3.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chees"
+version = "0.1.0"
+description = "中国象棋助手（纯 Python + 可选 Cython 搜索核）"
+requires-python = ">=3.9"
+dependencies = [
+    "opencv-python",
+    "numpy",
+    "pillow",
+]
+
+[project.optional-dependencies]
+native = ["Cython>=3.0"]
+
+[tool.setuptools.packages.find]
+include = ["engine*"]

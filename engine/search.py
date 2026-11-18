@@ -1,6 +1,9 @@
 """迭代加深 alpha-beta 搜索（置换表、静态搜索、空着剪枝、LMR、aspiration）。
 
 对外接口：search(board, time_limit, max_depth) -> SearchOutcome
+
+若已编译 Cython 扩展 engine._xiangqi，search() 优先走原生核；
+否则回退到本文件的纯 Python Searcher。
 """
 
 import time
@@ -26,6 +29,29 @@ _TT_DEPTH = [-1] * TT_SIZE
 _TT_SCORE = [0] * TT_SIZE
 _TT_FLAG = [0] * TT_SIZE
 _TT_MOVE = [None] * TT_SIZE
+
+try:
+    from engine._xiangqi import search_cells as _native_search_cells
+except ImportError:  # pragma: no cover - 未编译时回退
+    _native_search_cells = None
+
+
+def native_available() -> bool:
+    """是否已加载 Cython 搜索核。"""
+    return _native_search_cells is not None
+
+
+def _outcome_from_native(raw) -> "SearchOutcome":
+    return SearchOutcome(
+        best_move=raw["best_move"],
+        score=raw["score"],
+        depth=raw["depth"],
+        nodes=raw["nodes"],
+        elapsed_ms=raw["elapsed_ms"],
+        ranked=raw["ranked"],
+        pv=raw["pv"],
+        alt_depth=raw.get("alt_depth", 0),
+    )
 
 
 class TimeUp(Exception):
@@ -349,7 +375,18 @@ def search(board, time_limit: float = 4.0, max_depth: int = 8,
     time_limit 为总时间预算（秒）。根据上一层实际耗时预估下一层，
     超出预算就不再加深，保证在几秒内返回可用结果。
     top_n<=0 时跳过备选着法复核；fill_pv=False 时 PV 只跟置换表。
+    若存在 engine._xiangqi，优先走原生核。
     """
+    if _native_search_cells is not None:
+        raw = _native_search_cells(
+            board.cells, board.turn, time_limit, max_depth, top_n, fill_pv)
+        return _outcome_from_native(raw)
+    return search_python(board, time_limit, max_depth, top_n, fill_pv)
+
+
+def search_python(board, time_limit: float = 4.0, max_depth: int = 8,
+                  top_n: int = 2, fill_pv: bool = True) -> SearchOutcome:
+    """纯 Python 搜索（基准 / 回退路径）。"""
     searcher = Searcher(board, time_limit, max_depth)
     best = None
     last_duration = 0.0

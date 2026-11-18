@@ -151,7 +151,21 @@ def main():
         if mid.exists():
             jobs.append((mid, dict(GT_103459)))
 
+    # 未 --clear 时从已有最大序号继续，避免覆盖旧模板
     counters = {}
+    for sub, chars in (("red", "RNBAKCP"), ("black", "rnbakcp")):
+        d = tmpl_root / sub
+        if not d.exists():
+            continue
+        for ch in chars:
+            idxs = []
+            for f in d.glob(f"{ch}_*.png"):
+                try:
+                    idxs.append(int(f.stem.split("_", 1)[1]))
+                except (IndexError, ValueError):
+                    continue
+            if idxs:
+                counters[ch] = max(idxs) + 1
     total = 0
     for path, labels in jobs:
         print(f"\n== {path.name} ({len(labels)} labels) ==")

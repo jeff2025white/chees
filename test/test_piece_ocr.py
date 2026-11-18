@@ -50,14 +50,16 @@ def test_opening_still_valid():
 
 
 def test_103438_left_rook_horse():
-    """缺角底线勿套 RNB 模板：左侧红车(r0c1)、红马(r2c2)。"""
+    """缺角底线勿套 RNB 模板：左侧红车(r0c1)、红马(r2c2)；黑马已跳出勿补假马。"""
     clear_template_cache()
     a = analyze_image(str(ROOT / "images" / "Screenshot_20261117-103438.png"))
     assert a.grid[0][1] == "R", a.grid[0]
     assert a.grid[2][2] == "N", a.grid[2]
     assert a.grid[0][7] == "N", a.grid[0]
     assert a.grid[0][8] == "R", a.grid[0]
-    assert a.grid[9] == list("rnbakabnr"), a.grid[9]
+    # 黑双马已跳至 row7，底线马位应空，不能补成 rnbakabnr
+    assert a.grid[9] == list("r.bakab.r"), a.grid[9]
+    assert a.grid[7][2] == "n" and a.grid[7][6] == "n", a.grid[7]
 
 
 def test_112752_black_horse_elephant():
@@ -83,6 +85,34 @@ def test_classify_cell_type_rook():
     assert ch == "R" and sc > 0.5, (ch, sc)
 
 
+def test_20261118_jumped_horses_not_rooks():
+    """跳马后勿补假马占配额：真马应仍是 N/n，不能被标成车。"""
+    clear_template_cache()
+    cases = [
+        ("capture_20261118_130754.png", [(2, 2, "N"), (2, 6, "N"), (7, 2, "n"), (7, 6, "n")]),
+        ("capture_20261118_130659.png", [(2, 2, "N"), (7, 2, "n")]),
+        ("Screenshot_20261118-123743.png", [(2, 2, "N"), (2, 6, "N"), (7, 2, "n"), (7, 6, "n")]),
+    ]
+    for name, cells in cases:
+        path = ROOT / "images" / name
+        if not path.exists():
+            continue
+        a = analyze_image(str(path))
+        for r, c, expect in cells:
+            assert a.grid[r][c] == expect, (name, r, c, expect, a.grid[r][c], a.grid)
+
+
+def test_20261118_opening_intact():
+    clear_template_cache()
+    path = ROOT / "images" / "Screenshot_20261118-130353.png"
+    if not path.exists():
+        return
+    a = analyze_image(str(path))
+    assert a.grid[0] == list("RNBAKABNR"), a.grid[0]
+    assert a.grid[9] == list("rnbakabnr"), a.grid[9]
+    assert a.valid
+
+
 if __name__ == "__main__":
     test_templates_loaded_both_colors()
     print("ok templates")
@@ -96,4 +126,8 @@ if __name__ == "__main__":
     print("ok 103438")
     test_112752_black_horse_elephant()
     print("ok 112752")
+    test_20261118_jumped_horses_not_rooks()
+    print("ok 20261118 horses")
+    test_20261118_opening_intact()
+    print("ok 20261118 opening")
     print("ALL PASS")

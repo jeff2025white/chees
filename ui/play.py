@@ -54,9 +54,29 @@ BG = "#1f2430"
 PANEL = "#2b3242"
 FG = "#e6e6e6"
 ACCENT = "#e23b3b"
-UI_FONT = ("Microsoft YaHei", 10)
-UI_FONT_B = ("Microsoft YaHei", 10, "bold")
-TITLE_FONT = ("Microsoft YaHei", 13, "bold")
+
+
+def _ui_font_family(root=None) -> str:
+    """选一套本机有中文的字体。
+
+    不调用 tkfont.families()：在部分 macOS + 系统 Tk 上会卡住主线程。
+    """
+    if sys.platform == "darwin":
+        return "PingFang SC"
+    if sys.platform == "win32":
+        return "Microsoft YaHei"
+    return "Noto Sans CJK SC"
+
+
+_FONT_FAMILY = None
+
+
+def _fonts(root=None):
+    global _FONT_FAMILY
+    if _FONT_FAMILY is None:
+        _FONT_FAMILY = _ui_font_family(root)
+    fam = _FONT_FAMILY
+    return (fam, 10), (fam, 10, "bold"), (fam, 13, "bold"), fam
 
 WINDOW_W, WINDOW_H = 1024, 768
 
@@ -173,14 +193,29 @@ class PlayApp:
         self._layout = None           # 画布格子几何，供点击换算
 
         self._build_ui()
-        self.canvas.bind("<Configure>", lambda _e: self._draw_board())
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<Button-1>", self._on_click)
         self._set_status("红方行棋 · 点击棋子走棋")
+        # 首帧：等布局算出真实尺寸后再画，避免 Configure 过早清空画布
+        self.root.after_idle(self._draw_board)
+        self.root.after(80, self._draw_board)
+
+    def _on_canvas_configure(self, _event=None):
+        if self.canvas.winfo_width() < 40 or self.canvas.winfo_height() < 40:
+            return
+        self._draw_board()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
+        ui_font, ui_font_b, title_font, fam = _fonts(self.root)
+
         outer = tk.Frame(self.root, bg=BG)
         outer.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # 先 pack 右侧固定栏，再 pack 左侧 expand，否则右侧会被挤成 0 宽
+        right = tk.Frame(outer, bg=PANEL, width=340)
+        right.pack(side="right", fill="y", padx=(10, 0))
+        right.pack_propagate(False)
 
         left = tk.Frame(outer, bg=PANEL)
         left.pack(side="left", fill="both", expand=True)
@@ -191,28 +226,24 @@ class PlayApp:
         status = tk.Frame(left, bg=PANEL)
         status.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
         self.lbl_status = tk.Label(status, text="", bg=PANEL, fg=FG,
-                                   font=UI_FONT, anchor="center")
+                                   font=ui_font, anchor="center")
         self.lbl_status.pack(fill="x")
-
-        right = tk.Frame(outer, bg=PANEL, width=340)
-        right.pack(side="right", fill="y", padx=(10, 0))
-        right.pack_propagate(False)
 
         # 底栏链接先 pack，贴在右侧面板底部
         footer = tk.Frame(right, bg=PANEL)
         footer.pack(side="bottom", fill="x", padx=16, pady=(8, 16))
         FlatButton(
-            footer, text="截图分析 →", font=UI_FONT_B, command=self.open_analysis,
+            footer, text="截图分析 →", font=ui_font_b, command=self.open_analysis,
             activebackground=ACCENT, padx=8, pady=12,
         ).pack(fill="x")
 
         tk.Label(right, text="中国象棋对弈", bg=PANEL, fg=FG,
-                 font=TITLE_FONT).pack(pady=(16, 14), padx=16, anchor="w")
+                 font=title_font).pack(pady=(16, 14), padx=16, anchor="w")
 
         depth_box = tk.Frame(right, bg=PANEL)
         depth_box.pack(fill="x", padx=16, pady=(6, 0))
         self.lbl_depth = tk.Label(depth_box, text="难度：6（深度 6 层）",
-                                  bg=PANEL, fg=FG, font=UI_FONT, anchor="w")
+                                  bg=PANEL, fg=FG, font=ui_font, anchor="w")
         self.lbl_depth.pack(fill="x")
 
         self.depth_var = tk.IntVar(value=6)
@@ -226,7 +257,7 @@ class PlayApp:
         self.scale_depth.pack(fill="x")
 
         tk.Label(depth_box, text="浅 ←　　　　　　→ 深", bg=PANEL, fg="#8a93a8",
-                 font=("Microsoft YaHei", 9), anchor="center").pack(fill="x", pady=(2, 0))
+                 font=(fam, 9), anchor="center").pack(fill="x", pady=(2, 0))
 
     def _on_depth_change(self, *_args):
         d = self.depth_var.get()
@@ -276,10 +307,12 @@ class PlayApp:
 
     def _draw_board(self):
         geo = self._board_geometry()
+        if geo is None:
+            # 尺寸未就绪时不要 delete，否则会留下永久空白
+            return
         self._layout = geo
         self.canvas.delete("all")
-        if geo is None:
-            return
+        _, _, _, fam = _fonts()
 
         x0, y0, cell = geo["x0"], geo["y0"], geo["cell"]
         # 底板略大于线网，给边缘棋子留白
@@ -313,13 +346,12 @@ class PlayApp:
 
         # 楚河汉界
         river_y = y0 + 4.5 * cell
+        river_font = (fam, max(12, int(cell * 0.38)), "bold")
         self.canvas.create_text(
-            x0 + 2 * cell, river_y, text="楚 河", fill=RIVER_FG,
-            font=("Microsoft YaHei", max(12, int(cell * 0.38)), "bold"),
+            x0 + 2 * cell, river_y, text="楚 河", fill=RIVER_FG, font=river_font,
         )
         self.canvas.create_text(
-            x0 + 6 * cell, river_y, text="汉 界", fill=RIVER_FG,
-            font=("Microsoft YaHei", max(12, int(cell * 0.38)), "bold"),
+            x0 + 6 * cell, river_y, text="汉 界", fill=RIVER_FG, font=river_font,
         )
 
         # 上一步起止：半透明蓝方块（与棋盘底色混合）
@@ -361,6 +393,7 @@ class PlayApp:
         # 棋子
         piece_r = cell * 0.38
         font_size = max(14, int(cell * 0.42))
+        piece_font = (fam, font_size, "bold")
         for sq, piece in enumerate(self.board.cells):
             if not piece:
                 continue
@@ -373,8 +406,7 @@ class PlayApp:
                 fill=PIECE_FILL, outline=outline, width=3,
             )
             self.canvas.create_text(
-                cx, cy, text=name, fill=outline,
-                font=("Microsoft YaHei", font_size, "bold"),
+                cx, cy, text=name, fill=outline, font=piece_font,
             )
 
     # -------------------------------------------------------------- 点击
@@ -538,6 +570,9 @@ class PlayApp:
 
 
 def main():
+    from tk_boot import reexec_with_modern_tk_if_needed
+
+    reexec_with_modern_tk_if_needed(__file__)
     _enable_dpi_awareness()
     root = tk.Tk()
     PlayApp(root)

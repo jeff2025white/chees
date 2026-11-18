@@ -18,6 +18,22 @@ python -m engine          # 引擎命令行
 
 依赖：`opencv-python`、`numpy`、`pillow`、`tkinter`。
 
+**macOS 注意**：系统自带 `/usr/bin/python3` 的 Tcl/Tk 8.5 在新系统上会**整窗白屏**。请安装 Homebrew 的 `python-tk`（如 `brew install python@3.14 python-tk@3.14`）。`ui/play.py` / `ui/app.py` 检测到旧 Tk 时会自动切到 `/opt/homebrew/bin/python3*`。
+
+### 可选：Cython 搜索核（大幅加速算棋）
+
+未编译时自动回退纯 Python，功能不变。编译后 `search()` 走 `engine._xiangqi`。
+
+```bash
+pip install 'Cython>=3.0'
+python setup.py build_ext --inplace   # 生成 engine/_xiangqi*.so（macOS/Linux）或 .pyd（Windows）
+python test/bench_native.py --depth 4
+```
+
+- **macOS / Linux**：需系统 C 编译器（Xcode CLT / gcc）
+- **Windows**：需 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（MSVC）
+- 对照：`from engine import native_available` → `True` 表示已加载原生核
+
 ## 数据流
 
 ```
@@ -42,7 +58,8 @@ python -m engine          # 引擎命令行
 | `engine/board.py` | 棋盘、`apply`/`undo`、Zobrist；增量 `base_score` / `piece_count` | `sq = row*9 + col` |
 | `engine/movegen.py` | 走子规则、合法性；马/象落点预计算 | 飞将、炮架在这里 |
 | `engine/evaluate.py` | 子力+PST+出子/控线/将帅；单次扫盘 | 改棋力主要改 PST |
-| `engine/search.py` | Negamax、空着/LMR/aspiration、定长 TT、静态搜索 | `top_n`/`fill_pv` 控制复核与 PV |
+| `engine/search.py` | Negamax、空着/LMR/aspiration、定长 TT、静态搜索；优先 `_xiangqi` | `top_n`/`fill_pv` 控制复核与 PV |
+| `ext/_xiangqi.pyx` | Cython 搜索核（Board/着法/评估/搜索） | `setup.py build_ext --inplace` |
 | `engine/book.py` | 开局库 | 命中后第 1 手用库，分析路径再续搜补 PV |
 | `engine/notation.py` | ICCS / 中文记谱 | |
 | `engine/explain.py` | 着法理由、标签 | 分析页 `reason` |
@@ -143,8 +160,8 @@ python test/batch_run.py             # 批量识别+决策
 
 ## 已知限制
 
-- 兵种靠开局位置推断，中局区分车马炮兵能力弱。
-- 亮棕黑子与木纹难分；底线马位可用间隙修复补漏，中局仍可能漏检。
+- 兵种：近开局位置种子 + 单格墨迹模板（NCC，含小范围平移）；跳马后不再误补底线假马。
+- 亮棕黑子与木纹难分；底线马位可用间隙修复补漏（已跳出则跳过），中局仍可能漏检。
 - 棋盘靠棋子聚类拟合，大面积遮挡可能失败。
 - 纯 Python 搜索；深度 ≥8 时分析页预算很长，对弈页用更短预算保响应。
 - 截图按钮仅支持 Windows：置前标题含「手游助手」的窗口后按客户区截屏。
