@@ -20,6 +20,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 
 import cv2
 import tkinter as tk
@@ -119,6 +120,67 @@ def _enable_dpi_awareness():
             pass
 
 
+def _find_game_window(keyword="手游助手"):
+    """枚举可见顶层窗口，返回标题包含 keyword 的句柄列表（仅 Windows）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found = []
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def _cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        n = user32.GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(hwnd, buf, n + 1)
+        if keyword in buf.value:
+            found.append(hwnd)
+        return True
+
+    user32.EnumWindows(enum_proc(_cb), 0)
+    return found
+
+
+def _bring_to_front(hwnd):
+    """恢复最小化窗口并置前，便于从屏幕截取客户区。"""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)       # SW_RESTORE
+    else:
+        user32.ShowWindow(hwnd, 5)       # SW_SHOW
+    user32.SetForegroundWindow(hwnd)
+
+
+def _capture_window_client(hwnd):
+    """截取窗口客户区（不含标题栏与边框），返回 PIL Image。
+
+    模拟器多为 DirectX/OpenGL 渲染，PrintWindow / 窗口 DC BitBlt 常得到黑图，
+    因此直接按客户区矩形从屏幕截取；调用前需确保窗口已置前且未被遮挡。
+    进程已声明 DPI 感知，客户区坐标与 ImageGrab 同为物理像素。
+    """
+    import ctypes
+    from ctypes import wintypes
+    from PIL import ImageGrab
+
+    user32 = ctypes.windll.user32
+    rect = wintypes.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        raise OSError("GetClientRect 失败")
+    if rect.right <= 0 or rect.bottom <= 0:
+        raise OSError("窗口客户区尺寸为 0，可能已最小化")
+    origin = wintypes.POINT(0, 0)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+        raise OSError("ClientToScreen 失败")
+    box = (origin.x, origin.y, origin.x + rect.right, origin.y + rect.bottom)
+    return ImageGrab.grab(bbox=box, all_screens=True)
+
+
 class ChessApp:
     def __init__(self, root):
         self.root = root
@@ -201,8 +263,7 @@ class ChessApp:
         self.btn_play.pack(fill="x")
 
         self.btn_open = self._mk_button(right, "打开图片", self.open_image)
-        self.btn_shot = self._mk_button(right, "截图（暂未实现）", self.not_implemented)
-        self.btn_shot.configure(state="disabled")
+        self.btn_shot = self._mk_button(right, "截图", self.capture_screen)
         self.btn_calc = self._mk_button(right, "计算", self.calculate)
 
         # 迭代深度拉杆
@@ -242,7 +303,7 @@ class ChessApp:
         self.info.configure(state="disabled")
 
         self._write_info([("head", "使用说明\n"),
-                          ("", "1. 打开图片或直接使用 images 目录\n"
+                          ("", "1. 打开图片 / 截图（手游助手窗口）\n"
                                "2. ◀ ▶ 切换上一张 / 下一张\n"
                                "3. 点击计算，走位线标注在图上\n"
                                "（方向键左右也可切换）")])
@@ -310,8 +371,43 @@ class ChessApp:
         self.index = (self.index + 1) % len(self.files)
         self._load_current()
 
-    def not_implemented(self):
-        messagebox.showinfo("提示", "截图功能暂未实现。")
+    def capture_screen(self):
+        """查找标题含「手游助手」的窗口并截图，保存到当前图片目录后载入显示。"""
+        if sys.platform != "win32":
+            messagebox.showinfo("提示", "窗口截图目前仅支持 Windows。")
+            return
+        hwnds = _find_game_window("手游助手")
+        if not hwnds:
+            messagebox.showwarning(
+                "未找到窗口",
+                "没有找到标题包含「手游助手」的窗口。\n请先启动手游助手并打开象棋游戏。",
+            )
+            return
+        hwnd = hwnds[0]
+        try:
+            _bring_to_front(hwnd)
+        except OSError as exc:
+            messagebox.showerror("截图失败", str(exc))
+            return
+        self._write_info([("head", "截图中\n"),
+                          ("", "已置前手游助手窗口，正在截取客户区…")])
+        # 等窗口完成前台渲染再截，避免拿到旧帧或被本窗遮挡的画面
+        self.root.after(500, lambda: self._grab_window(hwnd))
+
+    def _grab_window(self, hwnd):
+        try:
+            img = _capture_window_client(hwnd)
+        except Exception as exc:                          # noqa: BLE001
+            messagebox.showerror("截图失败", str(exc))
+            return
+        folder = self.dir_path or os.path.join(_ROOT, "images")
+        os.makedirs(folder, exist_ok=True)
+        name = time.strftime("capture_%Y%m%d_%H%M%S") + ".png"
+        img.save(os.path.join(folder, name))
+        self.load_directory(folder, select=name)
+        self._write_info([("head", "截图完成\n"),
+                          ("", f"{name}\n尺寸 {img.width}×{img.height}\n\n"),
+                          ("", "点击「计算」识别局面并给出走位建议。")])
 
     def open_play(self):
         """另开人机对弈窗口（与本窗并存）。"""
