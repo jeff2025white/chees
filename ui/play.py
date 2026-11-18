@@ -242,11 +242,11 @@ class PlayApp:
 
         depth_box = tk.Frame(right, bg=PANEL)
         depth_box.pack(fill="x", padx=16, pady=(6, 0))
-        self.lbl_depth = tk.Label(depth_box, text="难度：6（深度 6 层）",
+        self.lbl_depth = tk.Label(depth_box, text="难度：7（深度 7 层）",
                                   bg=PANEL, fg=FG, font=ui_font, anchor="w")
         self.lbl_depth.pack(fill="x")
 
-        self.depth_var = tk.IntVar(value=6)
+        self.depth_var = tk.IntVar(value=7)
         self.depth_var.trace_add("write", self._on_depth_change)
         self.scale_depth = tk.Scale(
             depth_box, from_=2, to=12, orient="horizontal", variable=self.depth_var,

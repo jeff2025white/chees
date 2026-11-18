@@ -2,10 +2,23 @@
 
 两个界面共用同一套自研引擎：
 
-1. **截图分析** `ui/app.py`：识别截图 → 搜索最佳着法 → 在图上标注推演
+1. **截图分析** `ui/app.py`：打开图片或 **自动监听** → 识别 → 搜索最佳着法 → 在图上标注推演
 2. **人机对弈** `ui/play.py`：红方（下方）对电脑，右侧难度拉杆 = 迭代深度
 
 两侧底部有互跳按钮；对弈进行中若无显式放行，直接启动分析窗会被 `.play_session.lock` 拦住（避免其它进程抢开窗口）。
+
+### 自动监听（截图分析 · Windows）
+
+右侧「自动监听」按钮：找到标题含「手游助手」的窗口并置前，后台约每秒截客户区一帧：
+
+1. `detect_board_fx`：中部墨云/吃/将军等特效帧直接跳过（不识别、不落盘）
+2. `analyze_array` 内存识别（不先落盘）
+3. 棋盘判定：`grid_str` 同时含红帅 `K` 与黑将 `k` 才算有棋盘（首页/结算页跳过）
+4. 帧差：与上一有效局面 `grid_str` 不同，或首次有棋盘 → 触发计算
+5. 计算期间暂停截图；算完用 `annotate` 覆盖预览，日志追加本次推演
+6. 默认**不落盘**；右侧「自动截图」拉杆 >0 时写入 `images/auto/`，只保留最近 N 张（上限 50）
+
+手动「打开图片」+「计算」仍可用；监听中会禁用打开/计算，点「停止监听」退出。特效扫描：`python test/detect_fx_overlay.py images/`。
 
 ## 运行
 
@@ -37,10 +50,10 @@ python test/bench_native.py --depth 4
 ## 数据流
 
 ```
-截图 PNG
-  └─ engine/recognize.py : analyze_image()  → Analysis
-        └─ engine/decide.py : decide_position() → dict（着法 + PV）
-              └─ engine/recognize.py : annotate() → 标注 BGR 图
+截图 PNG / 自动监听帧
+  └─ analyze_image(path) 或 analyze_array(bgr)  → Analysis
+        └─ decide_position(grid, side=view_side, view_side=view_side, …)
+              └─ annotate() → 标注 BGR 图
 
 对弈（无识别）
   └─ Board / 人机走子
@@ -48,7 +61,7 @@ python test/bench_native.py --depth 4
                            top_n=0, fill_pv=False)
 ```
 
-`ui/app.py` / `ui/play.py` 均在后台线程算棋，结果经 `queue.Queue` 回主线程。
+`ui/app.py` / `ui/play.py` 均在后台线程算棋，结果经 `queue.Queue` 回主线程。自动监听另有截图循环线程；计算中用 `_computing` 暂停截帧。
 
 ## 模块职责
 
@@ -65,8 +78,9 @@ python test/bench_native.py --depth 4
 | `engine/explain.py` | 着法理由、标签 | 分析页 `reason` |
 | `engine/decide.py` | **对外唯一决策入口** | 改返回结构同步改 UI |
 | `engine/recognize.py` | 识别与标注 | HSV 阈值在文件顶部 |
-| `ui/app.py` | 截图分析界面 | 默认深度 6；`time_limit≈2.5·3^(d-4)` |
-| `ui/play.py` | 人机对弈界面 | 默认深度 6；更短预算；`fill_pv=False` |
+| `engine/fx_overlay.py` | 中部特效脏帧检测 | 自动监听跳过；`test/detect_fx_overlay.py` |
+| `ui/app.py` | 截图分析 / 自动监听 | 默认深度 7；`time_limit≈2.5·3^(d-4)`；监听仅 Windows |
+| `ui/play.py` | 人机对弈界面 | 默认深度 7；更短预算；`fill_pv=False` |
 | `test/test_xiangqi_engine.py` | 引擎回归 | 改引擎后必跑 |
 | `test/test_ui_smoke.py` | 分析界面冒烟 | 改 UI 后建议跑 |
 | `test/batch_run.py` | 批量识别+决策 | 改识别后主验证 |
@@ -147,7 +161,7 @@ vis = annotate(analysis, d)   # 新图，不改原图
 | 兵种推断 | `infer_pieces()` + `piece_ocr` 单格墨迹模板（`piece_templates/{red,black}/`） |
 | 棋力 | `evaluate.py` PST；`search.py` 深度/剪枝；`book.py` |
 | 分析 UI | `ui/app.py` |
-| 对弈 UI / 难度 | `ui/play.py`（默认深度 6） |
+| 对弈 UI / 难度 | `ui/play.py`（默认深度 7） |
 | 对弈响应速度 | `ui/play.py` 的 `time_limit` 公式 |
 
 ## 测试
@@ -162,6 +176,6 @@ python test/batch_run.py             # 批量识别+决策
 
 - 兵种：近开局位置种子 + 单格墨迹模板（NCC，含小范围平移）；跳马后不再误补底线假马。
 - 亮棕黑子与木纹难分；底线马位可用间隙修复补漏（已跳出则跳过），中局仍可能漏检。
-- 棋盘靠棋子聚类拟合，大面积遮挡可能失败。
+- 棋盘靠棋子聚类拟合，大面积遮挡可能失败。残局格宽由簇间距（含多格折算）估计，不再锁死整图宽比例（避免模拟器侧栏把 cell 估大、网格平移）。
 - 搜索默认优先使用已编译的 Cython 原生核，未编译时回退纯 Python；深度 ≥8 时分析页预算很长，对弈页用更短预算保响应。
-- 截图按钮仅支持 Windows：置前标题含「手游助手」的窗口后按客户区截屏。
+- 「自动监听」仅支持 Windows：置前标题含「手游助手」的窗口，按客户区屏幕截取（DirectX 窗口用 PrintWindow 常黑屏）。

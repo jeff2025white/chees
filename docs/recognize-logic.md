@@ -97,13 +97,23 @@ color = "R" if rp > bp else "B"
 
 用 `_cluster(values, gap)` 对 1D 坐标切分：把相邻间距 `> gap` 的点分开成两簇，每簇取均值作为一个候选行/列中心。聚类间隙阈值：`gap = 0.55 × default_cell`。
 
-### 4.3 格宽候选
+### 4.3 格宽估计（含残局）
 
-聚类后取簇间距的中位数作为 `base_cell`，然后在它周围扫 5 个候选：
+`width_cell = (76/720) × crop宽` 只作聚类间隙与分格参考。自动截图常为模拟器客户区（如 782 宽含侧栏），该值会比真实格宽大约 7%，**不能**在残局直接锁死它。
+
+估宽优先级：
+
+1. **近 1 格间距** `near`：簇差分落在 `[0.85, 1.15]×width_cell` → 取中位数（开局/中局主路径）
+2. **多格折算** `_unit_cells_from_gaps`：间距约 1～3.6 格时用 `round(d/ref)` 还原单位格宽再取中位数（残局行距常隔 2～3 格）
+3. 都没有才回退 `width_cell`
+
+`core` 棋子 &lt; 16 视为稀疏：在 `base_cell` 周围放宽微调，并用估得的 `base_cell`（而非偏大的 `width_cell`）重搜原点。此前稀疏路径强制 `cell=width_cell`，会导致网格整体平移、OCR 墨迹采偏。
+
+然后在 `base_cell` 周围扫候选：
 ```python
-cell_list = [base_cell + d * scale for d in (-1.0, -0.5, 0.0, 0.5, 1.0)]
+cell_list = [base_cell + d * scale for d in (-1.0, -0.5, 0.0, 0.5, 1.0)]  # 稀疏再放宽
 ```
-即 ±1.0×scale 的范围，`scale = crop宽度 / 720`，对应 ±1 像素级别的微调。
+`scale = crop宽度 / 720`。
 
 ### 4.4 轴向评分 `_score_axis`
 
@@ -116,13 +126,13 @@ cell_list = [base_cell + d * scale for d in (-1.0, -0.5, 0.0, 0.5, 1.0)]
 
 ### 4.5 二维复核
 
-取 `cell = (cell_y + cell_x)/2` 再跑一次 `_score_grid`，若命中数下降则退回只取 `cell_y`。
+取 `cell = (cell_y + cell_x)/2` 再跑一次 `_score_grid`，若命中数下降则退回只取 `cell_y`。稀疏时再用估宽候选重搜 `(row0, col0)`。
 
 ### 4.6 边界条件
 
 - 棋子数 < 6 → 报错退出（聚类失效）
 - `origin` 搜索时 `origin < -2 OR origin + span > dim + 2` 的直接跳过（不跑出图）
-- `base_cell` 若偏离 `[0.72×default_cell, 1.35×default_cell]` 则拉回
+- `base_cell` 相对 `width_cell`：稠密约 `[0.90, 1.10]`，稀疏/多样本约 `[0.80, 1.15]`，极端再兜底
 
 ---
 
@@ -240,7 +250,7 @@ BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]
 
 ### 8.1 `analyze_image(path)` → Analysis
 
-完整管线。返回 `Analysis` 对象，常用属性：
+读盘后走完整管线。返回 `Analysis` 对象，常用属性：
 
 | 属性 | 类型 | 说明 |
 |------|------|------|
@@ -253,7 +263,13 @@ BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]
 | `row0, col0, cell` | `float` | 网格参数（crop 坐标系） |
 | `cell_center(row, col)` | `(float, float)` | 整图坐标系的格子中心 |
 
-### 8.2 `annotate(analysis, decision)` → BGR ndarray
+### 8.2 `analyze_array(img, path="<memory>")` → Analysis
+
+与 `analyze_image` 同一套 ROI → 检测 → 网格 → 推断 → 校验；入参是 **BGR `ndarray`**，不读盘。
+
+`ui/app.py` 自动监听每秒一帧走这条路径（`path="<auto>"`），避免频繁磁盘 I/O。触发计算时再把该帧另存为 `images/auto_*.png`，供 `annotate` 与回看。
+
+### 8.3 `annotate(analysis, decision)` → BGR ndarray
 
 在原图上标注：
 1. **所有检出棋子**：黑色矩形描边（BGR `0,0,0`，边长 `0.92×cell`）

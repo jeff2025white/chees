@@ -7,12 +7,16 @@
     ┌──────────────────────────────┬──────────────────┐
     │                              │  中国象棋助手     │
     │         图片显示窗口          │  [ 打开图片 ]     │
-    │                              │  [  截图  ]       │
+    │                              │  [ 自动监听 ]     │
     │                              │  [  计算  ]       │
-    │                              │  ──────────       │
+    │                              │  迭代深度拉杆     │
     ├──────────────────────────────┤  识别 / 着法信息  │
     │  [◀]  文件名 (3/8)  [▶]      │                  │
     └──────────────────────────────┴──────────────────┘
+
+自动监听（Windows）：找「手游助手」窗口 → 每秒截客户区 → 特效过滤
+→ analyze_array → 主将判定棋盘 → grid_str 帧差 → decide + annotate。
+默认不落盘；「自动截图」拉杆 >0 时写入 images/auto/ 并环形保留。
 """
 
 import os
@@ -33,6 +37,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from engine import decide_position
+from engine.fx_overlay import detect_board_fx
 from engine.recognize import analyze_array, analyze_image, annotate
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -47,6 +52,10 @@ BTN_DISABLED_FG = "#7a8499"
 UI_FONT = ("Microsoft YaHei", 10)
 UI_FONT_B = ("Microsoft YaHei", 10, "bold")
 TITLE_FONT = ("Microsoft YaHei", 13, "bold")
+
+# 自动监听落盘：0=不保存（默认）；>0 时写入 images/auto/ 并只保留最近 N 张
+AUTO_SAVE_KEEP_DEFAULT = 0
+AUTO_SAVE_KEEP_MAX = 50
 
 
 # 启动窗口尺寸（物理像素）
@@ -277,11 +286,11 @@ class ChessApp:
         # 迭代深度拉杆
         depth_box = tk.Frame(right, bg=PANEL)
         depth_box.pack(fill="x", padx=16, pady=(6, 0))
-        self.lbl_depth = tk.Label(depth_box, text="迭代深度：6 层", bg=PANEL, fg=FG,
+        self.lbl_depth = tk.Label(depth_box, text="迭代深度：7 层", bg=PANEL, fg=FG,
                                   font=UI_FONT, anchor="w")
         self.lbl_depth.pack(fill="x")
 
-        self.depth_var = tk.IntVar(value=6)
+        self.depth_var = tk.IntVar(value=7)
         self.depth_var.trace_add("write", self._on_depth_change)
         self.scale_depth = tk.Scale(
             depth_box, from_=2, to=12, orient="horizontal", variable=self.depth_var,
@@ -290,6 +299,24 @@ class ChessApp:
             bd=0, sliderrelief="flat",
         )
         self.scale_depth.pack(fill="x")
+
+        # 自动截图保留张数：0=不落盘
+        keep_box = tk.Frame(right, bg=PANEL)
+        keep_box.pack(fill="x", padx=16, pady=(8, 0))
+        self.lbl_auto_keep = tk.Label(
+            keep_box, text=self._auto_keep_label(AUTO_SAVE_KEEP_DEFAULT),
+            bg=PANEL, fg=FG, font=UI_FONT, anchor="w",
+        )
+        self.lbl_auto_keep.pack(fill="x")
+        self.auto_keep_var = tk.IntVar(value=AUTO_SAVE_KEEP_DEFAULT)
+        self.auto_keep_var.trace_add("write", self._on_auto_keep_change)
+        self.scale_auto_keep = tk.Scale(
+            keep_box, from_=0, to=AUTO_SAVE_KEEP_MAX, orient="horizontal",
+            variable=self.auto_keep_var, showvalue=False, resolution=1,
+            bg=PANEL, fg=FG, troughcolor="#3b4459", activebackground=ACCENT,
+            highlightthickness=0, bd=0, sliderrelief="flat",
+        )
+        self.scale_auto_keep.pack(fill="x")
 
         tk.Frame(right, bg="#3b4459", height=1).pack(fill="x", padx=16, pady=12)
 
@@ -451,9 +478,12 @@ class ChessApp:
         self.btn_shot.configure(text="停止监听", activebackground="#ff6b6b")
         self.btn_open.configure(state="disabled")
         self.btn_calc.configure(state="disabled")
+        keep = int(self.auto_keep_var.get())
+        keep_txt = "不落盘" if keep <= 0 else f"保留最近 {keep} 张 → images/auto/"
         self._write_info([
             ("head", "自动监听中\n"),
-            ("", "每秒截图一次，主将判断棋盘，帧差触发计算。\n"),
+            ("", "每秒截图；特效帧跳过；主将判断棋盘；帧差触发计算。\n"),
+            ("", f"自动截图：{keep_txt}\n"),
             ("", "点击「停止监听」退出。\n\n"),
             ("warn", "首次截图需要窗口完全渲染，约 1 秒后开始。"),
         ])
@@ -477,7 +507,7 @@ class ChessApp:
         self._write_info([("head", "已停止自动监听\n")])
 
     def _auto_loop(self):
-        """后台线程：每秒截图 → 识别 → 主将判断棋盘 → 帧差 → 触发计算。"""
+        """后台线程：每秒截图 → 特效过滤 → 识别 → 主将判断棋盘 → 帧差 → 触发计算。"""
         import ctypes
         import numpy as np
 
@@ -506,6 +536,20 @@ class ChessApp:
                 time.sleep(1.0)
                 continue
             frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+            # 中部墨云/吃/将军等特效 → 跳过识别与计算，等下一帧
+            try:
+                fx = detect_board_fx(frame)
+            except Exception as exc:                      # noqa: BLE001
+                self.root.after(0, lambda: self._auto_status(f"特效检测异常：{exc}"))
+                time.sleep(1.0)
+                continue
+            if fx.get("dirty"):
+                level = fx.get("level", "?")
+                self.root.after(0, lambda lv=level: self._auto_status(
+                    f"[{time.strftime('%H:%M:%S')}] 特效遮挡（{lv}），跳过"))
+                time.sleep(1.0)
+                continue
 
             # 识别
             try:
@@ -555,24 +599,75 @@ class ChessApp:
                 self._busy = True         # 让轮询保持运行
                 self.root.after(0, self._auto_clear)   # 新计算先清旧日志
                 self.root.after(80, self._poll_result)
-                # 保存当前帧（标注输出用）
-                save_folder = os.path.join(_ROOT, "images")
-                os.makedirs(save_folder, exist_ok=True)
-                save_name = time.strftime("auto_%Y%m%d_%H%M%S") + ".png"
-                save_path = os.path.join(save_folder, save_name)
-                pil_img.save(save_path)
+                # 可选落盘（默认不保存；计算用内存中的 analysis）
+                save_path = self._save_auto_frame_if_needed(pil_img)
+                if save_path:
+                    analysis.path = save_path
 
                 depth = self.depth_var.get()
                 threading.Thread(
                     target=self._auto_calc_worker,
-                    args=(save_path, analysis, depth),
+                    args=(analysis, depth),
                     daemon=True,
                 ).start()
 
             # 等满 1 秒再截下一帧
             self._auto_stop.wait(1.0)
 
-    def _auto_calc_worker(self, save_path, analysis, max_depth):
+    @staticmethod
+    def _auto_keep_label(n: int) -> str:
+        if n <= 0:
+            return "自动截图：不保存"
+        return f"自动截图：保留最近 {n} 张"
+
+    def _on_auto_keep_change(self, *_args):
+        self.lbl_auto_keep.configure(
+            text=self._auto_keep_label(int(self.auto_keep_var.get()))
+        )
+
+    def _auto_save_dir(self) -> str:
+        return os.path.join(_ROOT, "images", "auto")
+
+    def _prune_auto_saves(self, keep: int) -> None:
+        """只保留 images/auto/auto_*.png 中最新的 keep 张。"""
+        if keep <= 0:
+            return
+        folder = self._auto_save_dir()
+        if not os.path.isdir(folder):
+            return
+        files = [
+            os.path.join(folder, name)
+            for name in os.listdir(folder)
+            if name.startswith("auto_") and name.lower().endswith(".png")
+        ]
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for path in files[keep:]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _save_auto_frame_if_needed(self, pil_img):
+        """按拉杆决定是否落盘；返回路径或 None。"""
+        try:
+            keep = int(self.auto_keep_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            keep = 0
+        if keep <= 0:
+            return None
+        folder = self._auto_save_dir()
+        os.makedirs(folder, exist_ok=True)
+        save_name = time.strftime("auto_%Y%m%d_%H%M%S") + ".png"
+        save_path = os.path.join(folder, save_name)
+        try:
+            pil_img.save(save_path)
+        except OSError as exc:
+            self.root.after(0, lambda: self._auto_status(f"截图保存失败：{exc}"))
+            return None
+        self._prune_auto_saves(keep)
+        return save_path
+
+    def _auto_calc_worker(self, analysis, max_depth):
         """自动模式下的计算 worker：完成后恢复截图循环。"""
         try:
             # 用已经识别好的 analysis 直接算，不用再识别

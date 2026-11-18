@@ -747,7 +747,7 @@ ui/app.py（截图分析）  ui/play.py（人机对弈）
 
 ### 12.3 难度、时间预算与实际深度的关系
 
-对弈页难度范围为 2～12，默认 6。时间预算公式位于 `ui/play.py::_engine_worker`：
+对弈页难度范围为 2～12，默认 7（native 加速后由 6 上调）。时间预算公式位于 `ui/play.py::_engine_worker`：
 
 | 设置深度 | 搜索时间预算 | 说明 |
 |---:|---:|---|
@@ -904,3 +904,69 @@ Native    0.030s   nodes=21,084   move=(64,65)   score=0
 - `.pyd` 是本地构建产物且被 `.gitignore` 排除；更换机器、Python 版本或拉取全新代码目录后，需要重新执行 `python setup.py build_ext --inplace`。
 - 想直接缩短高难度的最长等待：降低对弈页难度，或调整 `ui/play.py` 的 `time_limit` 公式；深度 5 当前预算为 3 秒。
 - 修改 Cython 源码后，应重新编译，并运行 `python test/bench_native.py --depth 4` 与 `python test/test_xiangqi_engine.py`，检查加速效果、结果一致性和规则回归。
+
+---
+
+## 13. 截图分析 · 自动监听（`ui/app.py`）
+
+按钮文案为「自动监听」/「停止监听」。与手动「打开图片 → 计算」共用同一套 `decide_position` / `annotate` 契约（`side=view_side`，我方先走，推演步数 ≈ 迭代深度，标注前两手）。
+
+### 13.1 启动条件
+
+| 项 | 行为 |
+|---|---|
+| 平台 | 仅 `win32`；其它系统弹提示 |
+| 目标窗 | `_find_game_window("手游助手")`，取第一个可见顶层窗 |
+| 置前 | `_bring_to_front`（恢复最小化 + `SetForegroundWindow`） |
+| UI | 按钮改「停止监听」；禁用「打开图片」「计算」；约 500ms 后起后台循环 |
+
+关闭分析窗时会 `stop_auto_listen()`。目标窗句柄失效（`IsWindow` 假）则自动停止并告警。
+
+### 13.2 循环（`_auto_loop`）
+
+```text
+约每秒一轮（计算中则 _computing 置位，循环 sleep 0.2s 不截图）
+  │
+  ├─ _capture_window_client(hwnd)
+  │     GetClientRect + ClientToScreen → ImageGrab 屏幕客户区
+  │     （不用 PrintWindow：模拟器 DirectX 常黑屏）
+  │
+  ├─ detect_board_fx(BGR)   # engine/fx_overlay.py
+  │     └─ dirty（墨云/吃/当头炮/将军等）→ 日志「特效遮挡」并跳过，不识别不落盘
+  │
+  ├─ analyze_array(BGR, path="<auto>")   # 内存识别
+  │
+  ├─ 有棋盘？  "K" in grid_str 且 "k" in grid_str
+  │     └─ 否（首页/结算等）→ 清 _last_grid_str，跳过计算
+  │
+  └─ 首次有棋盘 或 grid_str ≠ _last_grid_str
+        ├─ 主线程先显示原图（不等搜索）
+        ├─ 可选落盘 images/auto/auto_*.png（拉杆 N=0 默认不保存；>0 保留最近 N 张）
+        ├─ _computing.set()，清空信息区，启动 _poll_result
+        └─ _auto_calc_worker(已有 Analysis, 当前深度)  # 计算不依赖落盘
+              ├─ decide_position(grid, side=view_side, view_side=view_side,
+              │                  time_limit=min(90,max(4,2.5·3^(d-4))),
+              │                  max_depth=d, top_n=0)
+              ├─ annotate → queue
+              └─ finally: _computing.clear()  # 恢复截帧
+```
+
+局面未变时只写一行状态日志，不重复搜索。特效检测命令行：`python test/detect_fx_overlay.py images/`。
+
+### 13.3 与手动「计算」的差异
+
+| | 手动计算 | 自动监听触发 |
+|---|---|---|
+| 识别 | `analyze_image(path)` 读当前文件 | 循环里已 `analyze_array`，worker 不再识别 |
+| 触发 | 用户点「计算」 | 首次有棋盘 / `grid_str` 变化 |
+| 预览 | 算完才换标注图 | 变化时先原图，算完再覆盖标注 |
+| 信息区 | `_write_info` 整页重写 | 触发前清空，状态行与结果 `_auto_append`（最多约 500 行） |
+| 并发 | `_busy` + 禁用计算钮 | `_computing` 暂停截帧；监听中禁用打开/计算 |
+
+结果仍经 `queue.Queue`，主线程 `_poll_result`（约 80ms）取出后走 `_calc_done`；`_auto_running` 为真时走追加日志分支。
+
+### 13.4 辅助函数（同文件）
+
+- `_find_game_window` / `_bring_to_front` / `_capture_window_client`：Win32 找窗、置前、客户区截屏
+- `capture_screen` / `_grab_window`：仍保留的单次截图落盘路径（`capture_*.png`），当前主按钮已改为自动监听
+- `_auto_status` / `_auto_clear` / `_auto_show_raw` / `_auto_window_lost`：监听态 UI 更新

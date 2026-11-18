@@ -221,14 +221,35 @@ def _score_axis(values, origin, cell, count, tol):
     return score, hit
 
 
+def _unit_cells_from_gaps(centers, ref_cell):
+    """把簇间距折算成单位格宽。
+
+    残局相邻占用行常隔 2～3 格，直接取中位间距会把 cell 估大。
+    用 round(d/ref) 还原格数后再取 d/n；ref 仅作分格参考，可略偏。
+    """
+    if len(centers) < 2 or ref_cell <= 1e-6:
+        return []
+    units = []
+    for d in np.diff(np.asarray(centers, dtype=float)):
+        d = float(d)
+        if d < 0.70 * ref_cell or d > 3.60 * ref_cell:
+            continue
+        n = max(1, int(round(d / ref_cell)))
+        unit = d / n
+        if 0.75 * ref_cell <= unit <= 1.25 * ref_cell:
+            units.append(unit)
+    return units
+
+
 def find_grid(crop, pieces=None):
     """定位 10×9 网格。
 
     先用棋子坐标聚类估计格宽，再在「哪一簇对应第几行/第几列」上做轴向评分，
     只有几百次评估（早期版本用全图四重暴力搜索，耗时几十秒）。
 
-    残局棋子少时，相邻占用行间距常是 2～3 格，中位间距会把 cell 估大、
-    网格整体上移（底线棋子落到盘外）。此时锁定默认格宽再搜原点。
+    残局棋子少时，相邻占用行间距常是 2～3 格；不能直接取中位间距，
+    也不宜锁死「整图宽 × 76/720」——自动截图常含模拟器侧栏，该默认值会偏大，
+    网格整体平移后 OCR 全错。应把多格间距折算成单位格宽后再搜原点。
     """
     if pieces is None:
         pieces = detect_pieces(crop)
@@ -237,37 +258,56 @@ def find_grid(crop, pieces=None):
 
     h, w = crop.shape[:2]
     scale = w / _REF_W
-    default_cell = _CELL_RATIO * w
+    # 宽度比例默认值：仅作聚类间隙/分格参考；letterbox 截图上会偏大
+    width_cell = _CELL_RATIO * w
 
     # 排除顶部头像区 / 底部按钮区的杂点
     y_lo, y_hi = _TOP_UI * h, _BOTTOM_UI * h
     core = [p for p in pieces if y_lo <= p[1] <= y_hi] or pieces
 
-    rows = _cluster([p[1] for p in core], 0.55 * default_cell)
-    cols = _cluster([p[0] for p in core], 0.55 * default_cell)
+    rows = _cluster([p[1] for p in core], 0.55 * width_cell)
+    cols = _cluster([p[0] for p in core], 0.55 * width_cell)
     ys = [p[1] for p in core]
     xs = [p[0] for p in core]
 
-    # 格宽候选：只用「约 1 格」的间距；跨多行的空档不参与估宽
+    # 1 格间距 + 多格间距折算后的单位格宽
     near = []
+    units = []
     for seq in (rows, cols):
         if len(seq) < 2:
             continue
         for d in np.diff(seq):
-            if 0.85 * default_cell <= d <= 1.15 * default_cell:
-                near.append(float(d))
+            d = float(d)
+            if 0.85 * width_cell <= d <= 1.15 * width_cell:
+                near.append(d)
+        units.extend(_unit_cells_from_gaps(seq, width_cell))
+
     sparse = len(core) < 16
-    if sparse or not near:
-        base_cell = default_cell
-    else:
+    if near:
         base_cell = float(np.median(near))
-        if not (0.90 * default_cell <= base_cell <= 1.10 * default_cell):
-            base_cell = default_cell
+    elif units:
+        base_cell = float(np.median(units))
+    else:
+        base_cell = width_cell
+
+    # letterbox 时 width_cell 偏大；有足够间距样本时允许明显低于宽度默认值
+    lo = 0.80 * width_cell if (sparse or len(units) >= 3 or len(near) >= 3) else 0.90 * width_cell
+    hi = 1.15 * width_cell if sparse else 1.10 * width_cell
+    if not (lo <= base_cell <= hi):
+        if units:
+            base_cell = float(np.median(units))
+        elif not near:
+            base_cell = width_cell
+        if not (0.70 * width_cell <= base_cell <= 1.20 * width_cell):
+            base_cell = width_cell
 
     # 稀疏残局略放宽格宽微调，原点仍靠占用点对齐
     deltas = (-1.0, -0.5, 0.0, 0.5, 1.0) if not sparse else (
         -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0)
     cell_list = [base_cell + d * scale for d in deltas]
+    # 稀疏时若宽度默认与估宽差一截，把宽度默认也纳入候选，避免估偏无退路
+    if sparse and abs(width_cell - base_cell) > 1.5 * scale:
+        cell_list.append(width_cell)
     tol = 0.38 * base_cell
 
     def search_axis(values, centers, count):
@@ -300,25 +340,30 @@ def find_grid(crop, pieces=None):
         cell = cell_y
         s2, hit2 = _score_grid(core, row0, col0, cell_y, tol)
 
-    # 稀疏残局：若仍有棋子明显落在盘外，用固定默认格宽重搜原点
+    # 稀疏残局：用估得的 base_cell（不是偏大的 width_cell）重搜原点
     if sparse:
-        cell = default_cell
-        tol = 0.38 * cell
-        best = (hit2, s2, row0, col0)
-        for c in rows:
-            for k in range(ROWS):
-                r0 = float(c - k * cell)
-                if r0 < -2 or r0 + 9 * cell > h + 2:
-                    continue
-                for x in cols:
-                    for j in range(COLS):
-                        c0 = float(x - j * cell)
-                        if c0 < -2 or c0 + 8 * cell > w + 2:
-                            continue
-                        sc, ht = _score_grid(core, r0, c0, cell, tol)
-                        if ht > best[0] or (ht == best[0] and sc > best[1]):
-                            best = (ht, sc, r0, c0)
-        hit2, s2, row0, col0 = best
+        cell_candidates = [base_cell]
+        if abs(cell - base_cell) > 0.5 * scale:
+            cell_candidates.append(cell)
+        if abs(width_cell - base_cell) > 1.5 * scale:
+            cell_candidates.append(width_cell)
+        best = (hit2, s2, row0, col0, cell)
+        for cand in cell_candidates:
+            tol_s = 0.38 * cand
+            for c in rows:
+                for k in range(ROWS):
+                    r0 = float(c - k * cand)
+                    if r0 < -2 or r0 + 9 * cand > h + 2:
+                        continue
+                    for x in cols:
+                        for j in range(COLS):
+                            c0 = float(x - j * cand)
+                            if c0 < -2 or c0 + 8 * cand > w + 2:
+                                continue
+                            sc, ht = _score_grid(core, r0, c0, cand, tol_s)
+                            if ht > best[0] or (ht == best[0] and sc > best[1]):
+                                best = (ht, sc, r0, c0, cand)
+        hit2, s2, row0, col0, cell = best
 
     # 用已对齐的棋子反推原点，减小整体平移（透视/边距）
     row0, col0 = _refine_grid_origin(core, row0, col0, cell)

@@ -19,3 +19,6 @@ images/annotated/*.png
 
 # debug annotate dumps (incl. subdirs)
 images/annotated/
+
+# 自动监听环形缓冲截图
+images/auto/
