@@ -43,6 +43,8 @@ decide_position(
 ) -> dict
 ```
 
+残局自动加深：建盘后按 `piece_count` 调整（≤12 → +3，≤16 → +2，≤20 → +1；深度封顶 12），`time_limit` 按 `2^加成` 放大（封顶 90s）。分析页与对弈页均生效。
+
 ### 1.3 输出结构概览
 
 ```json
@@ -338,7 +340,8 @@ game_status(board, color) → (status, legal_moves)
 
 - row 6-9 全 0：未过河不加分，鼓励过河
 - row 5（河界己方侧）：中间列（col 3-5）加分最多 25
-- row 0-4（过河后）：从 60 递减，中间列最高，鼓励兵深入 + 占中路
+- row 2–3（对方九宫前沿）：峰值（中路最高约 75），鼓励兵逼宫
+- row 1→0（越过九宫再往底线）：位置分递减，边线更低，抑制一味拱到底的废兵
 
 **HORSE_PST 马**
 
@@ -922,7 +925,7 @@ Native    0.030s   nodes=21,084   move=(64,65)   score=0
 
 按钮文案为「自动监听」/「停止监听」。与手动「打开图片 → 计算」共用同一套 `decide_position` / `annotate` 契约（`side=view_side`，我方先走，推演步数 ≈ 迭代深度，标注前两手）。
 
-识别流水线（格网 / 兵种 CNN / 监听投票与一着迁移）见 [`docs/recognize-logic.md`](recognize-logic.md)；权重 `engine/models/piece_cls.pt`，无 torch 时回退模板 OCR。
+识别流水线（固定格网 → 圆检吸附 → 格心 enrich → 兵种 CNN / 监听投票与一着迁移）见 [`docs/recognize-logic.md`](recognize-logic.md)；权重 `engine/models/piece_cls.pt`，无 torch 时回退模板 OCR。`annotate` 画兵种字与前两手，不画棋子外包黑框。
 
 ### 13.1 启动条件
 

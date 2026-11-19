@@ -607,17 +607,17 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
                     counts[ch] = counts.get(ch, 0) + 1
         changed = False
 
-        # 1) 超配额：优先改掉「OCR 最不像该兵种」的格
+        # 1) 超配额：优先改掉「OCR 最不像该兵种」的格；无合法次优则清空
         for ch, hi in TYPE_QUOTA.items():
             excess = counts.get(ch, 0) - hi
             if excess <= 0:
                 continue
             cells = [(r, c) for r in range(len(grid)) for c in range(len(grid[0]))
-                     if grid[r][c] == ch and (r, c) in cell_scores]
+                     if grid[r][c] == ch]
 
             def _swap_key(rc):
                 r, c = rc
-                scores = cell_scores[rc]
+                scores = cell_scores.get(rc) or {}
                 cur = scores.get(ch, 0.0) + _scaled_bonus(r, c, ch, side, elephant_valid_fn)
                 alts = []
                 for alt, sc in scores.items():
@@ -636,12 +636,13 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
             for r, c in cells:
                 if excess <= 0:
                     break
-                scores = cell_scores[(r, c)]
+                scores = cell_scores.get((r, c)) or {}
                 ranked = sorted(
                     ((sc + _scaled_bonus(r, c, alt, side, elephant_valid_fn), sc, alt)
                      for alt, sc in scores.items() if alt != ch),
                     reverse=True,
                 )
+                moved = False
                 for _tot, _raw, alt in ranked:
                     if counts.get(alt, 0) >= TYPE_QUOTA.get(alt, 0):
                         continue
@@ -652,19 +653,27 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
                     counts[alt] = counts.get(alt, 0) + 1
                     excess -= 1
                     changed = True
+                    moved = True
                     break
+                if not moved:
+                    # 各兵种均已达上限 → 清空，不硬改成炮/兵等
+                    grid[r][c] = "."
+                    counts[ch] = counts.get(ch, 1) - 1
+                    excess -= 1
+                    changed = True
 
-        # 2) 非法位置：该格换次优
+        # 2) 非法位置：该格换次优；无配额内合法着则清空
         for (r, c) in list(violations.keys()):
             ch = grid[r][c]
-            scores = cell_scores.get((r, c))
-            if not scores:
+            if ch in (".", "@", "#"):
                 continue
+            scores = cell_scores.get((r, c)) or {}
             ranked = sorted(
                 ((sc + _scaled_bonus(r, c, alt, side, elephant_valid_fn), alt)
                  for alt, sc in scores.items()),
                 reverse=True,
             )
+            moved = False
             for _tot, alt in ranked:
                 if alt == ch:
                     continue
@@ -676,10 +685,16 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
                 counts[ch] = counts.get(ch, 1) - 1
                 counts[alt] = counts.get(alt, 0) + 1
                 changed = True
+                moved = True
                 break
+            if not moved:
+                grid[r][c] = "."
+                counts[ch] = counts.get(ch, 1) - 1
+                changed = True
 
         if not changed:
             break
+    enforce_type_quota(grid, cell_scores)
     valid, _, _ = validate_fn(grid, side)
     return valid
 
@@ -820,8 +835,40 @@ def _score_markers_templates(grid, crop, row0, col0, cell, piece_masks_fn):
     return candidates, cell_scores
 
 
+def enforce_type_quota(grid, cell_scores=None):
+    """同色兵种超 TYPE_QUOTA 时，优先丢掉 OCR 最不像该兵种的格 → '.'。
+
+    不把多余子改判成其他兵种（避免假占位马位变成炮）。
+    残留 @/# 一并清空。
+    """
+    cells_by = {ch: [] for ch in TYPE_QUOTA}
+    for r, row in enumerate(grid):
+        for c, ch in enumerate(row):
+            if ch in cells_by:
+                cells_by[ch].append((r, c))
+    for ch, hi in TYPE_QUOTA.items():
+        cells = cells_by[ch]
+        excess = len(cells) - hi
+        if excess <= 0:
+            continue
+
+        def _keep_score(rc, _ch=ch):
+            if cell_scores and rc in cell_scores:
+                return cell_scores[rc].get(_ch, 0.0)
+            return 0.0
+
+        cells.sort(key=_keep_score)  # 分低的先删
+        for r, c in cells[:excess]:
+            grid[r][c] = "."
+    for r, row in enumerate(grid):
+        for c, ch in enumerate(row):
+            if ch in ("@", "#"):
+                grid[r][c] = "."
+    return grid
+
+
 def _fill_unassigned_best(grid, cell_scores, used, side, elephant_valid_fn):
-    """残留 @/#：按候选分填合法次优，禁止无脑兜成车。"""
+    """残留 @/#：按候选分填合法次优；配额都不满足则清空，禁止无脑兜成车/炮。"""
     rows, cols = len(grid), len(grid[0]) if grid else 0
     for r in range(rows):
         for c in range(cols):
@@ -830,13 +877,16 @@ def _fill_unassigned_best(grid, cell_scores, used, side, elephant_valid_fn):
                 continue
             scores = cell_scores.get((r, c))
             if not scores:
-                # 无分数时宁可不猜车：用兵/卒作弱默认（配额允许）
+                # 无分数时宁可不猜车：用兵/卒作弱默认（配额允许）；否则清空
                 weak = "P" if marker == "@" else "p"
                 if used.get(weak, 0) < TYPE_QUOTA.get(weak, 0):
                     grid[r][c] = weak
                     used[weak] = used.get(weak, 0) + 1
+                else:
+                    grid[r][c] = "."
                 continue
             ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+            placed = False
             for ch, _sc in ranked:
                 if used.get(ch, 0) >= TYPE_QUOTA.get(ch, 0):
                     continue
@@ -844,7 +894,10 @@ def _fill_unassigned_best(grid, cell_scores, used, side, elephant_valid_fn):
                     continue
                 grid[r][c] = ch
                 used[ch] = used.get(ch, 0) + 1
+                placed = True
                 break
+            if not placed:
+                grid[r][c] = "."
 
 
 def ocr_fill_markers(grid, crop, row0, col0, cell, side, piece_masks_fn, elephant_valid_fn,
@@ -887,4 +940,8 @@ def ocr_fill_markers(grid, crop, row0, col0, cell, side, piece_masks_fn, elephan
         repair_by_ocr_conflict(grid, cell_scores, side, elephant_valid_fn)
         if validate_fn is not None:
             repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn)
+        else:
+            enforce_type_quota(grid, cell_scores)
+    else:
+        enforce_type_quota(grid, cell_scores or None)
     return filled, cell_scores

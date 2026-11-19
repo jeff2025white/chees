@@ -60,9 +60,11 @@ python test/bench_native.py --depth 4
 
 ```
 截图 PNG / 自动监听帧
-  └─ analyze_image(path) 或 analyze_array(bgr)  → Analysis
+  └─ analyze_image / analyze_array
+        ROI → 固定格网 → detect_pieces → occupy → enrich → infer(CNN/模板)
         └─ decide_position(grid, side=view_side, view_side=view_side, …)
-              └─ annotate() → 标注 BGR 图
+              （残局 piece_count 少时自动加深）
+              └─ annotate() → 兵种字 + 前两手（无外包黑框）
 
 对弈（无识别）
   └─ Board / 人机走子
@@ -79,16 +81,16 @@ python test/bench_native.py --depth 4
 | `engine/constants.py` | 棋盘尺寸、棋子编码、`PIECE_VALUE` | 大写=红、小写=黑 |
 | `engine/board.py` | 棋盘、`apply`/`undo`、Zobrist；增量 `base_score` / `piece_count` | `sq = row*9 + col` |
 | `engine/movegen.py` | 走子规则、合法性；马/象落点预计算 | 飞将、炮架在这里 |
-| `engine/evaluate.py` | 子力+PST+出子/控线/将帅；单次扫盘 | 改棋力主要改 PST |
+| `engine/evaluate.py` | 子力+PST+出子/控线/将帅；单次扫盘 | 改棋力主要改 PST（兵过九宫后递减） |
 | `engine/search.py` | Negamax、空着/LMR/aspiration、定长 TT、静态搜索；优先 `_xiangqi` | `top_n`/`fill_pv` 控制复核与 PV |
 | `ext/_xiangqi.pyx` | Cython 搜索核（Board/着法/评估/搜索） | `setup.py build_ext --inplace` |
 | `engine/book.py` | 开局库 | 命中后第 1 手用库，分析路径再续搜补 PV |
 | `engine/notation.py` | ICCS / 中文记谱 | |
 | `engine/explain.py` | 着法理由、标签 | 分析页 `reason` |
-| `engine/decide.py` | **对外唯一决策入口** | 改返回结构同步改 UI |
-| `engine/recognize.py` | 识别与标注 | `_BOARD_*` 固定格网；`annotate` 含棋盘轮廓 |
+| `engine/decide.py` | **对外唯一决策入口** | 残局按 `piece_count` 自动加深；改返回结构同步改 UI |
+| `engine/recognize.py` | 识别与标注 | `_BOARD_*` 固定格网；圆检→吸附→格心 enrich；`annotate` 无外包黑框 |
 | `engine/piece_model.py` | 兵种 TinyCNN（Torch）加载/批量推理 | 权重 `engine/models/piece_cls.pt` |
-| `engine/piece_ocr.py` | 兵种分配：CNN 优先，模板回退；配额/校验修补 | 禁止残留 `@` 兜成车 |
+| `engine/piece_ocr.py` | 兵种分配：CNN 优先，模板回退；配额/校验修补 | 超配额清空为 `.`，禁止改判其它兵种 |
 | `engine/fx_overlay.py` | 中部特效脏帧检测 | 自动监听跳过；`test/detect_fx_overlay.py` |
 | `ui/app.py` | 截图分析 / 自动监听 | 默认深度 7；`time_limit≈2.5·3^(d-4)`；监听仅 Windows |
 | `ui/play.py` | 人机对弈界面 | 默认深度 7；更短预算；`fill_pv=False` |
@@ -156,11 +158,13 @@ vis = annotate(analysis, d)   # 新图，不改原图
 | 人机对弈 | `min(30, max(2.5, 1.2·2.5^(d-4)))` | ~18.75s | ~7.5s |
 
 引擎按「上一层 ×3」预估是否继续加深；界面显示的是实际达到深度。native 下默认档通常远早于预算返回。
+`decide_position` 在 `piece_count≤20` 时会再自动加深度（≤20/+1，≤16/+2，≤12/+3，封顶 12 层），时间按 `2^加成` 放大（封顶 90s）。
 
 ## 标注样式
 
 `annotate()`（两手都要画）：
 
+- 兵种文字：格角中文（红/黑字色）；**不画**棋子外包黑框
 - 棋盘轮廓：青黄粗外框 + 四角角标（识别格网半格外扩）
 - 我方 `pv.steps[0]`：红线 + 红圈起点 + 蓝圈终点
 - 对方 `pv.steps[1]`：绿线 + 绿框起点 + 黄框终点
@@ -170,9 +174,9 @@ vis = annotate(analysis, d)   # 新图，不改原图
 
 | 想改什么 | 去哪里 |
 |---|---|
-| 识别颜色 / 网格 | `recognize.py` 顶部 `_BOARD_*` 固定布局、`classify` 格心采样 |
+| 识别占用 / 网格 | `recognize.py`：`_BOARD_*` 固定布局；`detect_pieces` → `occupy_from_pieces` → `enrich_occupancy_cell_masks` |
 | 兵种推断 | `infer_pieces()` + `piece_ocr`（**Torch CNN 优先**，回退模板）；`tools/export_piece_dataset.py` + `tools/train_piece_classifier.py` → `engine/models/piece_cls.pt` |
-| 棋力 | `evaluate.py` PST；`search.py` 深度/剪枝；`book.py` |
+| 棋力 | `evaluate.py` PST（兵过九宫后递减）；`decide.py` 残局加深；`search.py` / `book.py` |
 | 分析 UI | `ui/app.py` |
 | 对弈 UI / 难度 | `ui/play.py`（默认深度 7） |
 | 对弈响应速度 | `ui/play.py` 的 `time_limit` 公式 |

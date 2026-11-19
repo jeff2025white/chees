@@ -22,6 +22,28 @@ from .search import MATE, SearchOutcome, search
 
 SIDE_NAMES = {RED: "red", BLACK: "black"}
 
+# 残局自动加深：少子局面提高迭代深度与时间预算（上限与 UI 滑条一致）
+_ENDGAME_DEPTH_CAP = 12
+_ENDGAME_TIME_CAP = 90.0
+
+
+def endgame_search_budget(piece_count: int, max_depth: int, time_limit: float):
+    """按子数给残局加深度；时间按 2^加成放大，深度封顶 12、时间封顶 90s。"""
+    if piece_count <= 12:
+        bonus = 3
+    elif piece_count <= 16:
+        bonus = 2
+    elif piece_count <= 20:
+        bonus = 1
+    else:
+        return max_depth, time_limit
+    new_depth = min(_ENDGAME_DEPTH_CAP, max_depth + bonus)
+    gained = new_depth - max_depth
+    if gained <= 0:
+        return max_depth, time_limit
+    new_time = min(_ENDGAME_TIME_CAP, time_limit * (2.0 ** gained))
+    return new_depth, new_time
+
 
 def is_start_position(board) -> bool:
     """是否为标准开局（双方 16 子、将帅原位、棋子布局与 START_FEN 一致）。"""
@@ -203,6 +225,9 @@ def decide_position(
     # 截图分析时 side_to_move 与我方相同（我方先走）。
     to_move = board.turn
     our_side = view_side
+
+    max_depth, time_limit = endgame_search_budget(
+        board.piece_count, max_depth, time_limit)
 
     status, legal = game_status(board, to_move)
     base = {

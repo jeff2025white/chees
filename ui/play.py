@@ -24,7 +24,7 @@ import sys
 import threading
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -248,16 +248,33 @@ class PlayApp:
 
         self.depth_var = tk.IntVar(value=7)
         self.depth_var.trace_add("write", self._on_depth_change)
-        self.scale_depth = tk.Scale(
-            depth_box, from_=2, to=12, orient="horizontal", variable=self.depth_var,
-            showvalue=False, resolution=1, bg=PANEL, fg=FG,
-            troughcolor="#3b4459", activebackground=ACCENT, highlightthickness=0,
-            bd=0, sliderrelief="flat",
+        self._ensure_scale_style()
+        self.scale_depth = ttk.Scale(
+            depth_box, from_=2, to=12, orient="horizontal",
+            variable=self.depth_var, style="Accent.Horizontal.TScale",
+            command=lambda v: self.depth_var.set(int(round(float(v)))),
         )
         self.scale_depth.pack(fill="x")
 
         tk.Label(depth_box, text="浅 ←　　　　　　→ 深", bg=PANEL, fg="#8a93a8",
                  font=(fam, 9), anchor="center").pack(fill="x", pady=(2, 0))
+
+    @staticmethod
+    def _ensure_scale_style():
+        """ttk.Scale 在 clam 下可设滑块色；Windows 原生 tk.Scale 滑块几乎不可着色。"""
+        style = ttk.Style()
+        if style.theme_use() != "clam":
+            style.theme_use("clam")
+        style.configure(
+            "Accent.Horizontal.TScale",
+            background=ACCENT,
+            troughcolor="#1a2030",
+            bordercolor=PANEL,
+            lightcolor=ACCENT,
+            darkcolor="#b82e2e",
+            sliderthickness=18,
+            gripcount=0,
+        )
 
     def _on_depth_change(self, *_args):
         d = self.depth_var.get()

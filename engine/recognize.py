@@ -66,10 +66,9 @@ def _piece_masks(hsv):
 
 
 def _cell_color(rr, br, oran=0.0):
-    """由窗口内红/暗黑 mask 均值判 '@' / '#' / '.'。
+    """由窗口内红/暗黑 mask 均值判 '@' / '#' / '.'（classify 诊断用）。
 
-    oran 保留参数以兼容调用；亮棕补漏不在颜色阈值里做（与木纹不可分），
-    而在 classify 之后用底线马位间隙修复。
+    oran 保留参数以兼容调用。主路径占用来自圆检吸附，不依赖本函数补漏。
     """
     if rr > 0.04 and rr > br * 1.2:
         return "@"
@@ -92,6 +91,10 @@ def _horse_already_developed(grid, r, c, marker):
     return False
 
 
+def _side_occ_count(grid, marker):
+    return sum(1 for row in grid for ch in row if ch == marker)
+
+
 def _repair_backrow_horse_gaps(grid):
     """补回底线漏检的马位（col 1 / 7）。
 
@@ -99,8 +102,10 @@ def _repair_backrow_horse_gaps(grid):
     若某一行已有 ≥7 枚同色子且马位为空、左右邻为该色，则补上。
     只动 row 0-2 / 7-9，避免中局误补。
 
-    若该马位的日字跳点上已有同色子，视为马已跳出，禁止补假马——
-    否则会占掉 n/N 配额，把真马 OCR 成车（见 20261118 跳马局）。
+    若该行任一马位的日字跳点上已有同色子，视为马已出动，整行不再补——
+    否则空马位会被假占位，占掉 n/N 配额后被改判成炮/车
+    （见 20261118 跳马局、20261119_143731 马八空位）。
+    同色占位已达 16（一方子力上限）时也不再补。
     """
     for r in (0, 1, 2, 7, 8, 9):
         row = grid[r]
@@ -115,11 +120,15 @@ def _repair_backrow_horse_gaps(grid):
             maj = "#"
         else:
             continue
+        # 任一侧马已跳出 → 本行禁止补漏（避免空马位变假子）
+        if any(_horse_already_developed(grid, r, hc, maj) for hc in (1, 7)):
+            continue
         for c in (1, 7):
             if row[c] != ".":
                 continue
-            if _horse_already_developed(grid, r, c, maj):
-                continue
+            # 同色最多 16 子；已满则不可再造占位
+            if _side_occ_count(grid, maj) >= 16:
+                break
             left = row[c - 1] if c - 1 >= 0 else "."
             right = row[c + 1] if c + 1 < COLS else "."
             if left == maj or right == maj:
@@ -130,8 +139,8 @@ def _repair_backrow_horse_gaps(grid):
 def detect_pieces(crop):
     """连通域 + 面积 + 圆形度过滤，返回 [(cx, cy, 'R'|'B', area)]。
 
-    只用红 + 暗黑 mask 做连通域（亮棕与棋盘木纹接近，并入会污染网格）。
-    亮棕黑子漏检由 classify() 格心二次判定补回。
+    主路径占用检测入口：先检棋子圆，再吸附到固定格点。
+    只用红 + 暗黑 mask（亮棕与木纹接近，并入会污染）；漏检不造假子。
     """
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     red_mask, black_mask, _orange = _piece_masks(hsv)
@@ -261,14 +270,75 @@ def _refine_grid_origin(pieces, row0, col0, cell):
 
 
 # --------------------------------------------------------------------------
-# 格子颜色分类
+# 占用：圆检吸附到固定格点（主路径）/ 格心采样（诊断）
 # --------------------------------------------------------------------------
 
-def classify(crop, row0, col0, cell):
-    """按固定格心采样占用：返回 (grid_raw, centers)，'@'=红 '#'=黑 '.'=空。
+def occupy_from_pieces(pieces, row0, col0, cell, max_dist_ratio=0.42):
+    """将棋子圆吸附到固定 10×9 格点，生成 grid_raw。
 
-    主路径不再依赖连通域找子；空格（双 mask 都很低）直接 '.'，供后续 OCR 跳过。
-    随后对底线马位做间隙修复，补亮棕黑子漏检。
+    无圆 = '.'；同格多圆保留面积更大者。不补空位、不做马位间隙修复。
+    返回 (grid_raw, centers)，centers 为 90 个格心坐标。
+    """
+    grid = [["." for _ in range(COLS)] for _ in range(ROWS)]
+    best_area = [[0.0 for _ in range(COLS)] for _ in range(ROWS)]
+    centers = []
+    for r in range(ROWS):
+        for c in range(COLS):
+            centers.append((col0 + c * cell, row0 + r * cell))
+
+    max_dist = max_dist_ratio * float(cell)
+    for cx, cy, color, area in pieces:
+        cf = (cx - col0) / cell
+        rf = (cy - row0) / cell
+        ci, ri = int(round(cf)), int(round(rf))
+        if not (0 <= ci < COLS and 0 <= ri < ROWS):
+            continue
+        dist = ((cf - ci) ** 2 + (rf - ri) ** 2) ** 0.5 * cell
+        if dist > max_dist:
+            continue
+        marker = "@" if color == "R" else "#"
+        if grid[ri][ci] != "." and area <= best_area[ri][ci]:
+            continue
+        grid[ri][ci] = marker
+        best_area[ri][ci] = float(area)
+    return grid, centers
+
+
+def enrich_occupancy_cell_masks(grid, crop, row0, col0, cell):
+    """圆检漏子时的格心二次确认：只认红/暗黑 mask，不用亮棕（与木纹不可分）。
+
+    典型：黑士底色偏亮，连通域抓不到整圆，但格心墨迹仍进 black_mask。
+    不做马位规则补漏；已有圆的格不改写。
+    """
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    red_mask, black_mask, _orange = _piece_masks(hsv)
+    h, w = crop.shape[:2]
+    rad = max(6, int(cell * 0.22))
+    out = [list(row) for row in grid]
+    for r in range(ROWS):
+        for c in range(COLS):
+            if out[r][c] != ".":
+                continue
+            cy = row0 + r * cell
+            cx = col0 + c * cell
+            y0, y1 = max(0, int(cy) - rad), min(h, int(cy) + rad)
+            x0, x1 = max(0, int(cx) - rad), min(w, int(cx) + rad)
+            if y1 - y0 < 4 or x1 - x0 < 4:
+                continue
+            rr = float(red_mask[y0:y1, x0:x1].mean())
+            br = float(black_mask[y0:y1, x0:x1].mean())
+            if rr < 0.015 and br < 0.015:
+                continue
+            ch = _cell_color(rr, br)
+            if ch != ".":
+                out[r][c] = ch
+    return out
+
+
+def classify(crop, row0, col0, cell):
+    """按固定格心采样占用（诊断对照用）：返回 (grid_raw, centers)。
+
+    主识别路径已改为 detect_pieces → occupy_from_pieces；本函数不做马位补漏。
     """
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     h, w = crop.shape[:2]
@@ -289,18 +359,16 @@ def classify(crop, row0, col0, cell):
                 continue
             rr = float(red_mask[y0:y1, x0:x1].mean())
             br = float(black_mask[y0:y1, x0:x1].mean())
-            # 空格快路径：双色都极低则不必走阈值比较
             if rr < 0.015 and br < 0.015:
                 line.append(".")
                 continue
             line.append(_cell_color(rr, br))
         grid.append(line)
-    _repair_backrow_horse_gaps(grid)
     return grid, centers
 
 
 # --------------------------------------------------------------------------
-# 兵种推断（开局位置种子 + 单格墨迹 OCR）
+# 兵种推断（开局底线种子 + 单格 OCR；禁止兵行硬覆盖）
 # --------------------------------------------------------------------------
 
 def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None):
@@ -309,8 +377,8 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
     side: 我方颜色，"red" 表示红方在下（row 9），"black" 表示黑方在下。
     若 side=None，用 detect_our_side(grid_raw) 自动识别。
 
-    仅近开局（双方子力近满 + 完整底线）才位置种子；中局一律 OCR/CNN。
-    禁止把残留占位无脑兜成车。
+    仅近开局（双方子力近满 + 完整底线）才对仍为 @/# 的底线格做位置种子；
+    中局一律 OCR/CNN。禁止炮/兵行硬编码覆盖（避免真马被写成兵）。
     """
     from . import piece_ocr
 
@@ -348,10 +416,11 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
 
     red_full = backrow_complete(red_back, "@")
     black_full = backrow_complete(black_back, "#")
-    # 近开局门控：双方都接近满盘且至少一方底线完整，才允许位置种子
+    # 近开局门控：双方都接近满盘且至少一方底线完整，才允许底线种子
     near_opening = (red_n >= 14 and black_n >= 14 and (red_full or black_full))
 
     def seed_backrow_occupied(back, marker, letters, require_full):
+        """只改写仍为 marker 的格，不覆盖已有字母。"""
         if back is None:
             return False
         if require_full:
@@ -363,27 +432,9 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
             return True
         return False
 
-    def fill_cannon_pawn(backrow, marker, cannon, pawn):
-        if backrow is None:
-            return
-        step = 1 if backrow <= 4 else -1
-        cannon_row, pawn_row = backrow + 2 * step, backrow + 3 * step
-        if 0 <= cannon_row < ROWS:
-            for c in (1, 7):
-                if grid[cannon_row][c] == marker:
-                    grid[cannon_row][c] = cannon
-        if 0 <= pawn_row < ROWS:
-            for c in (0, 2, 4, 6, 8):
-                if grid[pawn_row][c] == marker:
-                    grid[pawn_row][c] = pawn
-
     if near_opening:
-        seeded_red = seed_backrow_occupied(red_back, "@", RED_BACKROW, require_full=True)
-        seeded_blk = seed_backrow_occupied(black_back, "#", BLACK_BACKROW, require_full=True)
-        if seeded_red or red_full:
-            fill_cannon_pawn(red_back, "@", "C", "P")
-        if seeded_blk or black_full:
-            fill_cannon_pawn(black_back, "#", "c", "p")
+        seed_backrow_occupied(red_back, "@", RED_BACKROW, require_full=True)
+        seed_backrow_occupied(black_back, "#", BLACK_BACKROW, require_full=True)
 
     can_ocr = (
         crop is not None and row0 is not None and col0 is not None and cell is not None
@@ -410,8 +461,8 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
         seed_partial_backrow(red_back, "@", RED_BACKROW)
         seed_partial_backrow(black_back, "#", BLACK_BACKROW)
 
-    # 仍残留的占位：弱默认兵/卒（有配额），禁止兜成车
-    from .piece_ocr import TYPE_QUOTA
+    # 仍残留的占位：弱默认兵/卒（有配额）；配额满则清空，禁止改判成其他兵种
+    from .piece_ocr import TYPE_QUOTA, enforce_type_quota
     counts = {}
     for row in grid:
         for ch in row:
@@ -423,10 +474,15 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
                 if counts.get("P", 0) < TYPE_QUOTA["P"]:
                     grid[r][c] = "P"
                     counts["P"] = counts.get("P", 0) + 1
+                else:
+                    grid[r][c] = "."
             elif grid[r][c] == "#":
                 if counts.get("p", 0) < TYPE_QUOTA["p"]:
                     grid[r][c] = "p"
                     counts["p"] = counts.get("p", 0) + 1
+                else:
+                    grid[r][c] = "."
+    enforce_type_quota(grid)
     return grid
 
 
@@ -816,7 +872,10 @@ def analyze_array(img, path="<memory>"):
 
     row0, col0, cell, _score, _hit = find_grid(
         crop, pieces=None, full_w=w, full_h=h, crop_y0=y0)
-    grid_raw, _centers = classify(crop, row0, col0, cell)
+    pieces = detect_pieces(crop)
+    grid_raw, _centers = occupy_from_pieces(pieces, row0, col0, cell)
+    # 圆检漏的亮底黑子（如士）：格心暗黑墨迹二次确认，不造空位假子
+    grid_raw = enrich_occupancy_cell_masks(grid_raw, crop, row0, col0, cell)
     hit = sum(1 for row in grid_raw for ch in row if ch != ".")
     score = float(hit)
 
@@ -874,7 +933,7 @@ def _load_cn_font(size):
 
 
 def _draw_piece_labels(vis, analysis, half):
-    """在每枚棋子描边方框左上角画中文兵种，颜色与棋子一致（红/黑）。
+    """在每枚棋子格角画中文兵种，颜色与棋子一致（红/黑）。
 
     字下垫高反差底色块，便于在木纹棋盘上核对识别结果。
     """
@@ -939,17 +998,7 @@ def annotate(analysis, decision, draw_grid=True):
     cell = a.cell
     half = int(cell * 0.46)
 
-    # --- 所有检出棋子：黑色矩形描边 ---
-    for r in range(ROWS):
-        for c in range(COLS):
-            if a.grid_raw[r][c] == ".":
-                continue
-            cx, cy = a.cell_center(r, c)
-            cx, cy = int(cx), int(cy)
-            cv2.rectangle(vis, (cx - half, cy - half), (cx + half, cy + half),
-                          (0, 0, 0), 2)
-
-    # --- 兵种文字：描边方框左上角，字色与棋子红/黑一致 ---
+    # --- 兵种文字：格角标注，字色与棋子红/黑一致（不再画外包黑框）---
     vis = _draw_piece_labels(vis, a, half)
 
     # --- 合法性校验：非法棋子画红X ---

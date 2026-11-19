@@ -28,7 +28,7 @@ import time
 
 import cv2
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -292,11 +292,11 @@ class ChessApp:
 
         self.depth_var = tk.IntVar(value=7)
         self.depth_var.trace_add("write", self._on_depth_change)
-        self.scale_depth = tk.Scale(
-            depth_box, from_=2, to=12, orient="horizontal", variable=self.depth_var,
-            showvalue=False, resolution=1, bg=PANEL, fg=FG,
-            troughcolor="#3b4459", activebackground=ACCENT, highlightthickness=0,
-            bd=0, sliderrelief="flat",
+        self._ensure_scale_style()
+        self.scale_depth = ttk.Scale(
+            depth_box, from_=2, to=12, orient="horizontal",
+            variable=self.depth_var, style="Accent.Horizontal.TScale",
+            command=lambda v: self.depth_var.set(int(round(float(v)))),
         )
         self.scale_depth.pack(fill="x")
 
@@ -310,11 +310,10 @@ class ChessApp:
         self.lbl_auto_keep.pack(fill="x")
         self.auto_keep_var = tk.IntVar(value=AUTO_SAVE_KEEP_DEFAULT)
         self.auto_keep_var.trace_add("write", self._on_auto_keep_change)
-        self.scale_auto_keep = tk.Scale(
+        self.scale_auto_keep = ttk.Scale(
             keep_box, from_=0, to=AUTO_SAVE_KEEP_MAX, orient="horizontal",
-            variable=self.auto_keep_var, showvalue=False, resolution=1,
-            bg=PANEL, fg=FG, troughcolor="#3b4459", activebackground=ACCENT,
-            highlightthickness=0, bd=0, sliderrelief="flat",
+            variable=self.auto_keep_var, style="Accent.Horizontal.TScale",
+            command=lambda v: self.auto_keep_var.set(int(round(float(v)))),
         )
         self.scale_auto_keep.pack(fill="x")
 
@@ -735,6 +734,23 @@ class ChessApp:
             )
         except OSError as exc:
             messagebox.showerror("无法启动", str(exc))
+
+    @staticmethod
+    def _ensure_scale_style():
+        """ttk.Scale 在 clam 下可设滑块色；Windows 原生 tk.Scale 滑块几乎不可着色。"""
+        style = ttk.Style()
+        if style.theme_use() != "clam":
+            style.theme_use("clam")
+        style.configure(
+            "Accent.Horizontal.TScale",
+            background=ACCENT,
+            troughcolor="#1a2030",
+            bordercolor=PANEL,
+            lightcolor=ACCENT,
+            darkcolor="#b82e2e",
+            sliderthickness=18,
+            gripcount=0,
+        )
 
     def _on_depth_change(self, *_args):
         self.lbl_depth.configure(text=f"迭代深度：{self.depth_var.get()} 层")
