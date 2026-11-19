@@ -551,6 +551,63 @@ def _palace_rows(is_red, side):
     return (0, 2) if red_bottom else (7, 9)
 
 
+def _valid_pawn_rows(is_red, side):
+    """兵/卒允许出现的行号集合。
+
+    兵卒只能向前，不能退回己方底线之后：
+      - 该色在图下方：起点 row6，向前到 0 → 合法行 0..6
+      - 该色在图上方：起点 row3，向前到 9 → 合法行 3..9
+    """
+    red_bottom = (side == "red")
+    on_bottom = (is_red == red_bottom)
+    return set(range(0, 7) if on_bottom else range(3, 10))
+
+
+def check_piece_zones(grid, side="red"):
+    """兵种位置带检查（识别后的简单规则测试）。
+
+    规则：
+      - 帅/将、仕/士：必须在己方九宫（3×3）
+      - 象/相：必须在己方田字 7 点（不过河）
+      - 兵/卒：不得出现在己方底线之后（见 ``_valid_pawn_rows``）
+
+    返回 (ok, violations)，violations 为 {(r,c): [原因, ...]}。
+    不含数量/飞将等其它规则；完整校验仍用 ``validate_grid``。
+    """
+    elep_red = _valid_elephant_positions(True, side)
+    elep_blk = _valid_elephant_positions(False, side)
+    pawn_red = _valid_pawn_rows(True, side)
+    pawn_blk = _valid_pawn_rows(False, side)
+    violations = {}
+
+    for r in range(ROWS):
+        for c in range(COLS):
+            ch = grid[r][c]
+            if ch == ".":
+                continue
+            is_red = ch.isupper()
+            msgs = []
+            if ch in ("K", "k"):
+                r0, r1 = _palace_rows(is_red, side)
+                if not (r0 <= r <= r1 and c in _PALACE_COLS):
+                    msgs.append("帅/将不在九宫内")
+            elif ch in ("A", "a"):
+                r0, r1 = _palace_rows(is_red, side)
+                if not (r0 <= r <= r1 and c in _PALACE_COLS):
+                    msgs.append("仕/士不在九宫内")
+            elif ch in ("B", "b"):
+                valid_set = elep_red if is_red else elep_blk
+                if (r, c) not in valid_set:
+                    msgs.append("象/相位置非法（过河或落点不在田字）")
+            elif ch in ("P", "p"):
+                allowed = pawn_red if is_red else pawn_blk
+                if r not in allowed:
+                    msgs.append("兵/卒超出前进范围（疑似退回己方底线后）")
+            if msgs:
+                violations[(r, c)] = msgs
+    return len(violations) == 0, violations
+
+
 def validate_grid(grid, side=None):
     """校验兵种推断后的 grid 是否符合象棋规则。
 
@@ -564,7 +621,6 @@ def validate_grid(grid, side=None):
     # side 应从 analyze_image 调用链传入；为兼容直接调用提供兜底
     if side is None:
         side = "red"
-    red_bottom = (side == "red")
     messages = []
     violations = {}  # (row, col) -> [positional violation texts]
     hard_messages = []  # 计数 + 位置（硬失败）
@@ -585,38 +641,14 @@ def validate_grid(grid, side=None):
             hard_messages.append(f"{ch} 数量超限：最多 {hi} 个，当前 {cnt}")
             messages.append(f"{ch} 数量超限：最多 {hi} 个，当前 {cnt}")
 
-    # --- 2. 位置 ---
-    elep_red = _valid_elephant_positions(True, side)
-    elep_blk = _valid_elephant_positions(False, side)
-
-    for r in range(ROWS):
-        for c in range(COLS):
-            ch = grid[r][c]
-            if ch == ".":
-                continue
-            is_red = ch.isupper()
-            msgs = []
-
-            if ch in ("K", "k"):
-                r0, r1 = _palace_rows(is_red, side)
-                if not (r0 <= r <= r1 and c in _PALACE_COLS):
-                    msgs.append("帅/将不在九宫内")
-
-            elif ch in ("A", "a"):
-                r0, r1 = _palace_rows(is_red, side)
-                if not (r0 <= r <= r1 and c in _PALACE_COLS):
-                    msgs.append("仕/士不在九宫内")
-
-            elif ch in ("B", "b"):
-                valid_set = elep_red if is_red else elep_blk
-                if (r, c) not in valid_set:
-                    msgs.append("象/相位置非法（过河或落点不在田字）")
-
-            if msgs:
-                violations[(r, c)] = msgs
-                for m in msgs:
-                    hard_messages.append(f"{ch} 在 ({r},{c})：{m}")
-                    messages.append(f"{ch} 在 ({r},{c})：{m}")
+    # --- 2. 位置带（九宫 / 象田 / 兵卒行）---
+    _zone_ok, zone_viol = check_piece_zones(grid, side)
+    for (r, c), msgs in zone_viol.items():
+        violations[(r, c)] = list(msgs)
+        ch = grid[r][c]
+        for m in msgs:
+            hard_messages.append(f"{ch} 在 ({r},{c})：{m}")
+            messages.append(f"{ch} 在 ({r},{c})：{m}")
 
     # --- 3. 帅/将同列无子（合法局面，仅提示）---
     kings = [(r, c) for r in range(ROWS) for c in range(COLS)

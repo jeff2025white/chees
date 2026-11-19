@@ -325,8 +325,21 @@ def save_color_template(bgr: np.ndarray, ch: str, index: int | None = None) -> s
     return path
 
 
+# 高置信 OCR：先验不得翻盘
+_OCR_LOCK_MARGIN = 0.10
+_OCR_LOCK_MIN = 0.55
+# 软先验缩放（硬非法仍用大惩罚）；中局勿让马位/兵位 bonus 压过模板分
+_PRIOR_SCALE = 0.35
+# OCR 与已分配冲突：top 比 assigned 高出该值则尝试纠正（valid 也做）
+_OCR_REPAIR_MARGIN = 0.12
+
+
 def position_type_bonus(r, c, ch, side, elephant_valid_fn):
-    """模板分上叠位置先验（不单独决定兵种；拉开马/车/炮易混分差）。"""
+    """模板分上叠位置先验（软暗示；硬约束见 ``_position_hard_ok``）。
+
+    正 bonus 已整体偏弱，避免中局把车判成马、炮判成卒。
+    负惩罚（出九宫将/士、象不在田字）保持较强。
+    """
     red_bottom = side == "red"
     is_red = ch.isupper()
     back = 9 if (is_red == red_bottom) else 0
@@ -340,53 +353,53 @@ def position_type_bonus(r, c, ch, side, elephant_valid_fn):
     bonus = 0.0
     if ch in ("K", "k"):
         r0, r1 = ((7, 9) if (is_red == red_bottom) else (0, 2))
-        bonus += 0.40 if (r0 <= r <= r1 and c in (3, 4, 5)) else -0.55
+        bonus += 0.18 if (r0 <= r <= r1 and c in (3, 4, 5)) else -0.55
         if r0 <= r <= r1 and c == 4:
-            bonus += 0.30
+            bonus += 0.08
     elif ch in ("A", "a"):
         r0, r1 = ((7, 9) if (is_red == red_bottom) else (0, 2))
-        bonus += 0.28 if (r0 <= r <= r1 and c in (3, 4, 5)) else -0.40
+        bonus += 0.12 if (r0 <= r <= r1 and c in (3, 4, 5)) else -0.40
         if r0 <= r <= r1 and c in (3, 5):
-            bonus += 0.14
+            bonus += 0.06
     elif ch in ("B", "b"):
         valid = elephant_valid_fn(is_red, side)
-        bonus += 0.38 if (r, c) in valid else -0.50
+        bonus += 0.16 if (r, c) in valid else -0.50
     elif ch in ("C", "c"):
         if cannon_home:
-            bonus += 0.32
+            bonus += 0.14
         elif c in (1, 7):
-            bonus += 0.06
+            bonus += 0.03
         else:
-            bonus -= 0.22
+            bonus -= 0.12
         if palace:
             bonus -= 0.35
         if horse_jump:
-            bonus -= 0.28
+            bonus -= 0.18
     elif ch in ("P", "p"):
         home = back + 3 * step
         if r == home and c in (0, 2, 4, 6, 8):
-            bonus += 0.42
+            bonus += 0.16
         crossed = (r > 4) if (back == 0) else (r < 5)
         if crossed and c in (0, 2, 4, 6, 8):
-            bonus += 0.15
+            bonus += 0.06
         if palace:
             bonus -= 0.25
     elif ch in ("N", "n"):
         if horse_home:
-            bonus += 0.28
+            bonus += 0.10
         if horse_jump:
-            bonus += 0.42
+            bonus += 0.16
         if cannon_home:
-            bonus -= 0.18
+            bonus -= 0.12
         if palace:
             bonus -= 0.30
     elif ch in ("R", "r"):
         if rook_home:
-            bonus += 0.28
+            bonus += 0.12
         if horse_jump:
-            bonus -= 0.38
+            bonus -= 0.22
         if cannon_home:
-            bonus -= 0.15
+            bonus -= 0.10
         if palace:
             bonus -= 0.20
     return bonus
@@ -404,32 +417,76 @@ def _position_hard_ok(r, c, ch, side, elephant_valid_fn) -> bool:
     return True
 
 
+def _ocr_top(scores):
+    """返回 (best_ch, best_sc, second_sc)。"""
+    if not scores:
+        return None, -1.0, -1.0
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    best_ch, best_sc = ranked[0]
+    second = ranked[1][1] if len(ranked) > 1 else -1.0
+    return best_ch, best_sc, second
+
+
+def _scaled_bonus(r, c, ch, side, elephant_valid_fn, *, hard_fail_penalty: float = 0.8):
+    bonus = position_type_bonus(r, c, ch, side, elephant_valid_fn)
+    if not _position_hard_ok(r, c, ch, side, elephant_valid_fn):
+        return bonus * _PRIOR_SCALE - hard_fail_penalty
+    # 负惩罚不缩放（出宫将/士仍要挡住）；正 bonus 缩小
+    if bonus >= 0:
+        return bonus * _PRIOR_SCALE
+    return bonus
+
+
 def assign_by_scores(candidates, used_counts, side, elephant_valid_fn, min_raw=0.10):
     """candidates: [(r, c, scores_dict, is_red)] → {(r,c): ch}。
 
-    同分接近时放大位置先验权重，专治马/车/炮墨迹接近。
+    两阶段：
+      1) 高置信 OCR（margin/分数够）先锁格，先验不得翻盘；
+      2) 其余格用缩小后的位置先验做全局贪心。
     """
     assignments = {}
-    opts = []
+    claimed = set()
+    counts = dict(used_counts)
+
+    # --- 阶段 1：锁高置信 ---
+    locks = []
     for r, c, scores, _is_red in candidates:
         if not scores:
+            continue
+        best_ch, best_sc, second = _ocr_top(scores)
+        if best_ch is None or best_sc < max(min_raw, _OCR_LOCK_MIN):
+            continue
+        if best_sc - second < _OCR_LOCK_MARGIN:
+            continue
+        if not _position_hard_ok(r, c, best_ch, side, elephant_valid_fn):
+            continue
+        locks.append((best_sc, r, c, best_ch))
+    locks.sort(reverse=True)
+    for raw, r, c, ch in locks:
+        if (r, c) in claimed:
+            continue
+        if counts.get(ch, 0) >= TYPE_QUOTA.get(ch, 0):
+            continue
+        assignments[(r, c)] = ch
+        claimed.add((r, c))
+        counts[ch] = counts.get(ch, 0) + 1
+
+    # --- 阶段 2：剩余格，弱先验 ---
+    opts = []
+    for r, c, scores, _is_red in candidates:
+        if not scores or (r, c) in claimed:
             continue
         ranked = sorted(scores.values(), reverse=True)
         top = ranked[0]
         second = ranked[1] if len(ranked) > 1 else -1.0
         close = (top - second) < 0.08
         for ch, sc in scores.items():
-            if not _position_hard_ok(r, c, ch, side, elephant_valid_fn):
-                # 仍允许候选，但重罚（校验重判时再换）
-                bonus = position_type_bonus(r, c, ch, side, elephant_valid_fn) - 0.8
-            else:
-                bonus = position_type_bonus(r, c, ch, side, elephant_valid_fn)
+            bonus = _scaled_bonus(r, c, ch, side, elephant_valid_fn)
+            # 仅在模板分接近时略抬先验，且不再 1.6 倍放大
             if close:
-                bonus *= 1.6
+                bonus *= 1.15
             opts.append((sc + bonus, sc, r, c, ch))
     opts.sort(reverse=True)
-    claimed = set()
-    counts = dict(used_counts)
     for _total, raw, r, c, ch in opts:
         if (r, c) in claimed:
             continue
@@ -441,6 +498,91 @@ def assign_by_scores(candidates, used_counts, side, elephant_valid_fn, min_raw=0
         claimed.add((r, c))
         counts[ch] = counts.get(ch, 0) + 1
     return assignments
+
+
+def _recount(grid):
+    counts = {}
+    for row in grid:
+        for ch in row:
+            if ch != ".":
+                counts[ch] = counts.get(ch, 0) + 1
+    return counts
+
+
+def repair_by_ocr_conflict(grid, cell_scores, side, elephant_valid_fn, rounds: int = 3):
+    """valid 局面也修：高置信 OCR 与分配冲突时纠正，必要时与弱置信同兵种格对换。
+
+    典型：马位先验把车锁成马占配额 → 真马只能改成兵；本函数把配额还给 OCR 更像马的格。
+    """
+    for _ in range(rounds):
+        counts = _recount(grid)
+        changed = False
+
+        conflicts = []
+        for (r, c), scores in cell_scores.items():
+            ch = grid[r][c]
+            if ch in (".", "@", "#") or not scores:
+                continue
+            best_ch, best_sc, _second = _ocr_top(scores)
+            if best_ch is None or best_ch == ch:
+                continue
+            cur_sc = scores.get(ch, -1.0)
+            if best_sc - cur_sc < _OCR_REPAIR_MARGIN:
+                continue
+            if not _position_hard_ok(r, c, best_ch, side, elephant_valid_fn):
+                continue
+            conflicts.append((best_sc - cur_sc, best_sc, r, c, ch, best_ch))
+        conflicts.sort(reverse=True)
+
+        for _gain, best_sc, r, c, cur, want in conflicts:
+            if grid[r][c] != cur:
+                continue
+            if counts.get(want, 0) < TYPE_QUOTA.get(want, 0):
+                grid[r][c] = want
+                counts = _recount(grid)
+                changed = True
+                continue
+
+            # 配额满：找 OCR 对 want 更弱的占位格，对换或改次优
+            donors = []
+            for rr in range(len(grid)):
+                for cc in range(len(grid[0])):
+                    if grid[rr][cc] != want or (rr, cc) == (r, c):
+                        continue
+                    other = cell_scores.get((rr, cc))
+                    donors.append((other.get(want, -1.0) if other else -1.0, rr, cc))
+            donors.sort()
+            for donor_sc, rr, cc in donors:
+                if donor_sc >= best_sc - 0.02:
+                    continue
+                donor_scores = cell_scores.get((rr, cc), {})
+                if _position_hard_ok(rr, cc, cur, side, elephant_valid_fn):
+                    grid[r][c] = want
+                    grid[rr][cc] = cur
+                    counts = _recount(grid)
+                    changed = True
+                    break
+                moved = False
+                for alt, _sc in sorted(donor_scores.items(), key=lambda kv: -kv[1]):
+                    if alt == want:
+                        continue
+                    # 释放 want：本格变 want，donor 变 alt；cur 少 1、alt 多 1
+                    if alt != cur and counts.get(alt, 0) >= TYPE_QUOTA.get(alt, 0):
+                        continue
+                    if not _position_hard_ok(rr, cc, alt, side, elephant_valid_fn):
+                        continue
+                    grid[r][c] = want
+                    grid[rr][cc] = alt
+                    counts = _recount(grid)
+                    changed = True
+                    moved = True
+                    break
+                if moved:
+                    break
+
+        if not changed:
+            break
+    return grid
 
 
 def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn, rounds: int = 4):
@@ -460,20 +602,18 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
                     counts[ch] = counts.get(ch, 0) + 1
         changed = False
 
-        # 1) 超配额：把多余的换成次优合法兵种（TYPE_QUOTA 存的是上限 int）
+        # 1) 超配额：优先改掉「OCR 最不像该兵种」的格
         for ch, hi in TYPE_QUOTA.items():
             excess = counts.get(ch, 0) - hi
             if excess <= 0:
                 continue
             cells = [(r, c) for r in range(len(grid)) for c in range(len(grid[0]))
                      if grid[r][c] == ch and (r, c) in cell_scores]
-            # 优先改：当前位置对 ch 先验差、且有好替代的
 
             def _swap_key(rc):
                 r, c = rc
                 scores = cell_scores[rc]
-                cur = scores.get(ch, 0.0) + position_type_bonus(
-                    r, c, ch, side, elephant_valid_fn)
+                cur = scores.get(ch, 0.0) + _scaled_bonus(r, c, ch, side, elephant_valid_fn)
                 alts = []
                 for alt, sc in scores.items():
                     if alt == ch:
@@ -482,7 +622,7 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
                         continue
                     if not _position_hard_ok(r, c, alt, side, elephant_valid_fn):
                         continue
-                    tot = sc + position_type_bonus(r, c, alt, side, elephant_valid_fn)
+                    tot = sc + _scaled_bonus(r, c, alt, side, elephant_valid_fn)
                     alts.append(tot)
                 best_alt = max(alts) if alts else -9.0
                 return (cur - best_alt, cur)  # 越小越该换
@@ -493,7 +633,7 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
                     break
                 scores = cell_scores[(r, c)]
                 ranked = sorted(
-                    ((sc + position_type_bonus(r, c, alt, side, elephant_valid_fn), sc, alt)
+                    ((sc + _scaled_bonus(r, c, alt, side, elephant_valid_fn), sc, alt)
                      for alt, sc in scores.items() if alt != ch),
                     reverse=True,
                 )
@@ -516,7 +656,7 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
             if not scores:
                 continue
             ranked = sorted(
-                ((sc + position_type_bonus(r, c, alt, side, elephant_valid_fn), alt)
+                ((sc + _scaled_bonus(r, c, alt, side, elephant_valid_fn), alt)
                  for alt, sc in scores.items()),
                 reverse=True,
             )
@@ -543,7 +683,7 @@ def ocr_fill_markers(grid, crop, row0, col0, cell, side, piece_masks_fn, elephan
                      validate_fn=None):
     """对 grid 中残留的 @/# 做单格 OCR 并写回字母。
 
-    返回 (填充数量, cell_scores)。若传入 validate_fn，填充后做校验重判。
+    返回 (填充数量, cell_scores)。若传入 validate_fn，填充后做 OCR 冲突修 + 校验重判。
     """
     templates = load_templates()
     color_templates = load_color_templates()
@@ -590,13 +730,15 @@ def ocr_fill_markers(grid, crop, row0, col0, cell, side, piece_masks_fn, elephan
         filled += 1
         used[ch] = used.get(ch, 0) + 1
 
-    if validate_fn is not None and cell_scores:
-        # 兜底 R/r 也没有分数；先把仍是标记的填上再修
+    if cell_scores:
         for r in range(rows):
             for c in range(cols):
                 if grid[r][c] == "@":
                     grid[r][c] = "R"
                 elif grid[r][c] == "#":
                     grid[r][c] = "r"
-        repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn)
+        # 先按 OCR 冲突纠正（valid 也适用），再跑规则校验重判
+        repair_by_ocr_conflict(grid, cell_scores, side, elephant_valid_fn)
+        if validate_fn is not None:
+            repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn)
     return filled, cell_scores
