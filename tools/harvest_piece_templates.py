@@ -19,10 +19,14 @@ import cv2
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from engine.piece_ocr import clear_template_cache, extract_cell_ink, save_template
+from engine.piece_ocr import (
+    clear_template_cache, extract_cell_ink, extract_cell_color,
+    save_template, save_color_template,
+)
 from engine.recognize import (
     RED_BACKROW, BLACK_BACKROW, ROWS, COLS,
-    _piece_masks, analyze_image,
+    _piece_masks, analyze_image, classify, find_grid, detect_our_side,
+    _ROI_Y0, _ROI_Y1,
 )
 
 # 中局人工核对过的局面（图坐标 row0=顶）
@@ -82,7 +86,8 @@ def _opening_labels(grid_raw, side):
     return labels
 
 
-def harvest(path: Path, labels: dict, counters: dict) -> int:
+def harvest(path: Path, labels: dict, counters: dict, color_counters: dict,
+            do_ink: bool = True, do_color: bool = True) -> int:
     a = analyze_image(str(path))
     x0, y0, x1, y1 = a.crop_box
     crop = a.image[y0:y1, x0:x1]
@@ -94,38 +99,70 @@ def harvest(path: Path, labels: dict, counters: dict) -> int:
             print(f"  skip empty r{r}c{c} want {ch}")
             continue
         is_red = ch.isupper()
-        # 颜色一致性检查
         marker = a.grid_raw[r][c]
         if (marker == "@") != is_red:
             print(f"  skip color mismatch r{r}c{c} raw={marker} label={ch}")
             continue
-        ink = extract_cell_ink(crop, rm, bm, a.col0 + c * a.cell, a.row0 + r * a.cell,
-                               a.cell, is_red)
-        if ink is None:
-            print(f"  skip no-ink r{r}c{c} {ch}")
-            continue
-        idx = counters.get(ch, 0)
-        path_out = save_template(ink, ch, index=idx)
-        counters[ch] = idx + 1
-        print(f"  + {ch}_{idx} <- {path.name} r{r}c{c} -> {path_out}")
-        n += 1
+        cx = a.col0 + c * a.cell
+        cy = a.row0 + r * a.cell
+        if do_ink:
+            ink = extract_cell_ink(crop, rm, bm, cx, cy, a.cell, is_red)
+            if ink is None:
+                print(f"  skip no-ink r{r}c{c} {ch}")
+            else:
+                idx = counters.get(ch, 0)
+                path_out = save_template(ink, ch, index=idx)
+                counters[ch] = idx + 1
+                print(f"  + ink {ch}_{idx} <- {path.name} r{r}c{c}")
+                n += 1
+        if do_color:
+            bgr = extract_cell_color(crop, cx, cy, a.cell)
+            if bgr is None:
+                print(f"  skip no-color r{r}c{c} {ch}")
+            else:
+                idx = color_counters.get(ch, 0)
+                path_out = save_color_template(bgr, ch, index=idx)
+                color_counters[ch] = idx + 1
+                print(f"  + color {ch}_{idx} <- {path.name} r{r}c{c} -> {path_out}")
+                n += 1
     return n
+
+
+def _labels_from_grid_raw(path: Path):
+    """不跑完整兵种 OCR，只用占用图 + 开局位置先验标号（采模板更干净）。"""
+    img = cv2.imread(str(path))
+    if img is None:
+        return None, {}
+    h, w = img.shape[:2]
+    y0 = int(_ROI_Y0 * h)
+    crop = img[y0:int(_ROI_Y1 * h), 0:w]
+    row0, col0, cell, _, _ = find_grid(crop, full_w=w, full_h=h, crop_y0=y0)
+    grid_raw, _ = classify(crop, row0, col0, cell)
+    side = detect_our_side(grid_raw) or "red"
+    return side, _opening_labels(grid_raw, side)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("images", nargs="*", help="截图路径；默认采内置集")
-    ap.add_argument("--clear", action="store_true", help="先清空 red/ black/ 再采")
+    ap.add_argument("--clear", action="store_true", help="先清空 ink/color 模板再采")
+    ap.add_argument("--ink-only", action="store_true")
+    ap.add_argument("--color-only", action="store_true")
+    ap.add_argument("--max-per-type", type=int, default=6, help="每种最多保留新采数量上限提示")
     args = ap.parse_args()
 
+    do_ink = not args.color_only
+    do_color = not args.ink_only
+
     tmpl_root = ROOT / "engine" / "piece_templates"
+    color_root = tmpl_root / "color"
     if args.clear:
         for sub in ("red", "black"):
-            d = tmpl_root / sub
-            if d.exists():
-                for f in d.glob("*.png"):
-                    f.unlink()
-        # 清掉旧扁平大写残留，避免混淆
+            for root in (tmpl_root, color_root):
+                d = root / sub
+                if d.exists():
+                    for f in d.glob("*.png"):
+                        f.unlink()
         for f in tmpl_root.glob("*.png"):
             f.unlink()
         clear_template_cache()
@@ -135,42 +172,49 @@ def main():
     if args.images:
         for p in args.images:
             path = Path(p)
-            a = analyze_image(str(path))
-            side = a.side
-            labels = _opening_labels(a.grid_raw, side)
+            _side, labels = _labels_from_grid_raw(path)
             if len(labels) < 10:
                 print(f"{path.name}: opening labels too few ({len(labels)}), skip")
                 continue
             jobs.append((path, labels))
     else:
-        opening = ROOT / "images" / "Screenshot_20261117-103346.png"
+        # 默认：images/ 根目录里占用较满的开局样张（最多 12 张）
+        cands = sorted((ROOT / "images").glob("*.png"))
+        for path in cands:
+            _side, labels = _labels_from_grid_raw(path)
+            if len(labels) >= 20:
+                jobs.append((path, labels))
+            if len(jobs) >= 12:
+                break
         mid = ROOT / "images" / "Screenshot_20261117-103459.png"
-        if opening.exists():
-            a = analyze_image(str(opening))
-            jobs.append((opening, _opening_labels(a.grid_raw, a.side)))
         if mid.exists():
             jobs.append((mid, dict(GT_103459)))
 
-    # 未 --clear 时从已有最大序号继续，避免覆盖旧模板
-    counters = {}
-    for sub, chars in (("red", "RNBAKCP"), ("black", "rnbakcp")):
-        d = tmpl_root / sub
-        if not d.exists():
-            continue
-        for ch in chars:
-            idxs = []
-            for f in d.glob(f"{ch}_*.png"):
-                try:
-                    idxs.append(int(f.stem.split("_", 1)[1]))
-                except (IndexError, ValueError):
-                    continue
-            if idxs:
-                counters[ch] = max(idxs) + 1
+    def _next_counters(root: Path):
+        counters = {}
+        for sub, chars in (("red", "RNBAKCP"), ("black", "rnbakcp")):
+            d = root / sub
+            if not d.exists():
+                continue
+            for ch in chars:
+                idxs = []
+                for f in d.glob(f"{ch}_*.png"):
+                    try:
+                        idxs.append(int(f.stem.split("_", 1)[1]))
+                    except (IndexError, ValueError):
+                        continue
+                if idxs:
+                    counters[ch] = max(idxs) + 1
+        return counters
+
+    counters = _next_counters(tmpl_root) if do_ink else {}
+    color_counters = _next_counters(color_root) if do_color else {}
     total = 0
     for path, labels in jobs:
         print(f"\n== {path.name} ({len(labels)} labels) ==")
-        total += harvest(path, labels, counters)
-    print(f"\nharvested {total} templates; counts={dict(sorted(counters.items()))}")
+        total += harvest(path, labels, counters, color_counters, do_ink, do_color)
+    print(f"\nharvested {total}; ink={dict(sorted(counters.items()))} "
+          f"color={dict(sorted(color_counters.items()))}")
 
 
 if __name__ == "__main__":

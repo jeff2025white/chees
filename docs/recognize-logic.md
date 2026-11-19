@@ -5,26 +5,28 @@
 ## 1. 整体流水线
 
 ```
-手机截图 (BGR, 720×1280)
+截图 (BGR；当前 images/* 多为 782×1332)
   │
   ▼  [ROI 裁剪]
-crop (去掉顶部头像/比分区、底部按钮区)
+crop（上下留缓冲，不全贴棋盘）
   │
-  ▼  [detect_pieces]
-棋子候选 [(cx, cy, 'R'|'B', area), ...]
+  ▼  [find_grid = 固定相对布局]
+row0/col0/cell ← 整图比例常量 × 宽高（可选 pieces 微调原点）
   │
-  ▼  [find_grid]
-网格参数 (row0, col0, cell)
+  ▼  [classify 格心采样]
+90 格 → grid_raw (@/#/.)；空格快路径跳过
   │
-  ▼  [classify]
-原始 grid_raw (@/#/.) + centers
+  ▼  [detect_our_side + infer_pieces]
+下方九宫主将 → 我方；近开局种子 + 墨迹/彩色 OCR + 校验重判
   │
-  ▼  [detect_red_bottom + infer_pieces]
-兵种推断 grid (R/N/B/A/K/C/P / r/n/b/a/k/c/p)
+  ▼  [可选时序投票]（analyze_array / 自动监听）
+占用不变时兵种最多 3 帧多数投票
   │
   ▼  [Analysis 封装]
-对外 Analysis 对象，供引擎决策 + annotate 标注使用
+对外 Analysis；annotate 画棋盘轮廓 + 网格 + 前两手
 ```
+
+`detect_pieces`（连通域）仍保留，供诊断或 `find_grid(..., pieces=...)` 微调；主识别路径不再调用。当前 `images/` 根目录截图均为 **782×1332**。
 
 ---
 
@@ -36,164 +38,106 @@ crop (去掉顶部头像/比分区、底部按钮区)
 |------|------|------|
 | `_ROI_Y0` | 101/1280 ≈ 0.079 | 裁剪顶部起点 |
 | `_ROI_Y1` | 1264/1280 ≈ 0.987 | 裁剪底部终点 |
-| `_TOP_UI` | 0.075 | 聚类阶段屏蔽顶部的阈值 |
-| `_BOTTOM_UI` | 0.92 | 聚类阶段屏蔽底部的阈值 |
+| `_TOP_UI` | 0.075 | 可选 refine 时屏蔽顶部杂点 |
+| `_BOTTOM_UI` | 0.92 | 可选 refine 时屏蔽底部杂点 |
+| `_BOARD_ROW0_ABS` | 0.25443 | 首格中心 Y / 图高（images/* 标定） |
+| `_BOARD_COL0_ABS` | 0.07344 | 首格中心 X / 图宽 |
+| `_BOARD_CELL_W` | 0.09782 | 格宽 / 图宽（替换旧 76/720） |
 
 裁剪后只保留 Y ∈ `[_ROI_Y0*H, _ROI_Y1*H]`、X ∈ `[0, W]` 的区域。
 
 ---
 
-## 3. 棋子检测 `detect_pieces`
+## 3. 棋子检测 `detect_pieces`（诊断 / 可选 refine）
 
-### 3.1 HSV Mask
+主路径已改为格心 `classify`，本函数仅在调试或 `find_grid(..., pieces=...)` 时使用。
 
-两张 mask 分别覆盖红方 / 黑方棋子底色：
-
-| Mask | H 条件 | S 条件 | V 条件 | 覆盖 |
-|------|--------|--------|--------|------|
-| **red_mask** | `H < 10 OR H > 160` | `S > 80` | `V > 80` | 深红底色棋子 |
-| **black_mask** | `H < 30` | `S < 100` | `40 < V < 100` | 暗黑底色棋子 |
-
-两张 mask 做 OR 合并得到 `piece_mask`，然后跑 **8 邻域连通域分析**。
-
-### 3.2 连通域过滤
-
-对每个连通域按以下条件筛掉噪声：
-
-| 条件 | 公式 | 依据 |
-|------|------|------|
-| 面积下限 | `area > 80 × scale²` | 棋子最小面积（scale = crop宽度/720） |
-| 面积上限 | `area < 800 × scale²` | 棋子最大面积（防止大块区域误检） |
-| 宽高下限 | `w > 15×scale AND h > 15×scale` | 棋子不会太小 |
-| 形状紧凑度 | `min(w,h) / max(w,h) > 0.55` | 棋子接近圆形，细长杂点过滤掉 |
-
-### 3.3 颜色判定
-
-通过连通域中心 `(cx, cy)` 周围一个小窗口（半径 `15×scale`）内两张 mask 的平均像素比例来定颜色：
-
-```python
-rp = red_mask[y0:y1, x0:x1].mean()
-bp = black_mask[y0:y1, x0:x1].mean()
-color = "R" if rp > bp else "B"
-```
-
-### 3.4 已知缺陷与补漏
-
-- **亮棕底色黑子漏检**：黑方棋子底色偶尔会出现亮棕色变体（H≈15–20, V≈200+），与棋盘木纹在 HSV 上几乎不可分，不能并入连通域（会把整盘木纹当棋子）。
-- **格心后处理**：`classify` 之后调用 `_repair_backrow_horse_gaps`——若底线行（row 0–2 / 7–9）已有 ≥7 枚同色子，且马位 col1/col7 为空、邻格为该色，则补回该色。若该马位日字跳点上已有同色子，视为马已跳出，**禁止补假马**（否则占掉 n/N 配额，真马被标成车）。专治开局底线马漏检，不靠橙色 mask。
+HSV 仍分红 / 暗黑两路连通域（亮棕不进 mask，避免整盘木纹）。过滤：面积、边长、圆形度；中心窗口比红黑 mask 定色。亮棕漏检靠 `classify` 后的 `_repair_backrow_horse_gaps`（底线马位间隙修复；马已跳出则禁止补假马）。
 
 ---
 
-## 4. 网格定位 `find_grid`
+## 4. 网格定位 `find_grid`（固定相对布局）
 
 ### 4.1 核心思路
 
-不是暴力搜索整张图，而是分三步：
-1. **棋子坐标一维聚类**：沿 X/Y 轴分别聚成若干簇，每簇对应一行/一列的棋子
-2. **格宽估计**：簇间距的中位数就是格宽 `base_cell`
-3. **轴向评分**：在每个候选簇上找"哪一簇对应第几行/列"的 origin + cell 组合
+棋盘在 App 截图中的相对位置固定，按整图宽高缩放：
 
-### 4.2 聚类
-
-用 `_cluster(values, gap)` 对 1D 坐标切分：把相邻间距 `> gap` 的点分开成两簇，每簇取均值作为一个候选行/列中心。聚类间隙阈值：`gap = 0.55 × default_cell`。
-
-### 4.3 格宽估计（含残局）
-
-`width_cell = (76/720) × crop宽` 只作聚类间隙与分格参考。自动截图常为模拟器客户区（如 782 宽含侧栏），该值会比真实格宽大约 7%，**不能**在残局直接锁死它。
-
-估宽优先级：
-
-1. **近 1 格间距** `near`：簇差分落在 `[0.85, 1.15]×width_cell` → 取中位数（开局/中局主路径）
-2. **多格折算** `_unit_cells_from_gaps`：间距约 1～3.6 格时用 `round(d/ref)` 还原单位格宽再取中位数（残局行距常隔 2～3 格）
-3. 都没有才回退 `width_cell`
-
-`core` 棋子 &lt; 16 视为稀疏：在 `base_cell` 周围放宽微调，并用估得的 `base_cell`（而非偏大的 `width_cell`）重搜原点。此前稀疏路径强制 `cell=width_cell`，会导致网格整体平移、OCR 墨迹采偏。
-
-然后在 `base_cell` 周围扫候选：
 ```python
-cell_list = [base_cell + d * scale for d in (-1.0, -0.5, 0.0, 0.5, 1.0)]  # 稀疏再放宽
+cell  = _BOARD_CELL_W * full_w
+col0  = _BOARD_COL0_ABS * full_w
+row0  = _BOARD_ROW0_ABS * full_h - crop_y0   # 转到 ROI crop 坐标
 ```
-`scale = crop宽度 / 720`。
 
-### 4.4 轴向评分 `_score_axis`
+标定来源：`images/` 根目录（不含子目录）782×1332 截图、原搜索路径 `hit≥20` 的中位数。换皮肤或改棋盘边距后需重测这三项。
 
-对每个候选格宽 `cell ∈ cell_list`、每个候选簇中心 `c ∈ centers`、每个偏移 `k ∈ [0, count)`：
-- `origin = c - k * cell` 即假设这一簇放在第 k 行，反推第 0 行在哪
-- 然后把所有棋子 `values` 投到这个网格上：若 `abs(v - (origin + k*cell)) < tol`（`tol = 0.38×base_cell`）就算命中
-- 命中得分 `score += 1.0 - 0.5 × d/tol`（越靠近格心分越高）
+### 4.2 可选原点微调
 
-取命中数最多的组合。X 轴和 Y 轴独立搜索，得到 `(row0, cell_y)` 和 `(col0, cell_x)`。
+若传入 `pieces`（连通域中心），用 `_refine_grid_origin` 按最近格点反推 `row0/col0`；主路径不传 pieces，直接用固定值。
 
-### 4.5 二维复核
+### 4.3 与旧聚类搜索的关系
 
-取 `cell = (cell_y + cell_x)/2` 再跑一次 `_score_grid`，若命中数下降则退回只取 `cell_y`。稀疏时再用估宽候选重搜 `(row0, col0)`。
-
-### 4.6 边界条件
-
-- 棋子数 < 6 → 报错退出（聚类失效）
-- `origin` 搜索时 `origin < -2 OR origin + span > dim + 2` 的直接跳过（不跑出图）
-- `base_cell` 相对 `width_cell`：稠密约 `[0.90, 1.10]`，稀疏/多样本约 `[0.80, 1.15]`，极端再兜底
+旧「棋子聚类 + 轴向暴力搜 origin」已移除。残局侧栏导致 `76/720` 格宽偏大、网格平移的问题随之消失。
 
 ---
 
-## 5. 格子颜色分类 `classify`
+## 5. 格子颜色分类 `classify`（主占用检测）
 
 ### 5.1 逐格扫描
 
-网格参数 `(row0, col0, cell)` 已知后，扫描 10×9 = 90 个格子：
+固定格网下扫描 10×9 格心，窗口半径 `rad = 0.22 × cell`：
+
 ```python
 for r in range(10):
     cy = row0 + r * cell
     for c in range(9):
         cx = col0 + c * cell
 ```
-在格子中心取半径 `rad = 0.22 × cell` 的圆形（实际是正方形）窗口做判定。
 
 ### 5.2 判定逻辑
 
 | 条件 | 结果 |
 |------|------|
+| `rr < 0.015 AND br < 0.015` | `.`（空格快路径） |
 | `rr > 0.04 AND rr > br × 1.2` | `@`（红） |
 | `br > 0.05 AND br > rr × 1.2` | `#`（黑） |
 | `rr > br × 0.8 AND rr > 0.02` | `@`（红） |
 | `br > rr × 0.8 AND br > 0.02` | `#`（黑） |
 | 其余 | `.`（空） |
 
-其中：
-- `rr = red_mask[窗口].mean()`
-- `br = black_mask[窗口].mean()`
-
-判定顺序是"谁显著大于谁 → 判谁"，退而求其次"谁略大于谁但仍高于绝对阈值 → 判谁"。两边都不够就判空。
+其中 `rr`/`br` 为窗口内红/黑 mask 均值。随后 `_repair_backrow_horse_gaps` 补底线亮棕马漏检。
 
 ### 5.3 输出
 
-- `grid_raw`：10 行 × 9 列的字符串列表，`@/#/.` 占位
-- `centers`：81 个格子中心坐标（整 crop 像素）
+- `grid_raw`：10×9 的 `@/#/.`
+- `centers`：90 个格心（crop 像素）
+- `Analysis.hit`：非空格数（占用计数）
 
-### 5.4 为什么这么简单也能工作
-
-回顾一次典型格子的数值（来自 `Screenshot_20261117-103438.png`）：
+### 5.4 典型格心数值（历史样例）
 
 | 格子 | rr | br | 判定 |
 |------|------|------|------|
-| 红车 r0c1 | 0.451 | 0.000 | `@` ✅ |
-| 黑车 r9c0 | 0.000 | 0.292 | `#` ✅ |
-| 天元空格 r4c4 | 0.000 | 0.000 | `.` ✅ |
-| 亮棕黑漏检 r9c1 | 0.000 | 0.000 | `.` ❌ 应该是 `#` |
-
-红子和暗底黑子都能正确覆盖，只有亮棕底色黑子（整格子 rr=br=0）判成空格。
+| 红车 | 0.451 | 0.000 | `@` |
+| 暗底黑 | 0.000 | 0.292 | `#` |
+| 空格 | 0.000 | 0.000 | `.` |
+| 亮棕黑 | 0.000 | 0.000 | `.`（靠底线补漏） |
 
 ---
 
-## 6. 红方方向判断 `detect_red_bottom`
+## 6. 我方颜色 `detect_our_side`（≠ 固定红色）
 
-统计图像上半部 `rows 0-1` 和下半部 `rows 8-9` 的红 / 黑比例：
+**契约**：图下方 = 我方 = `view_side` / `Analysis.view_side`，由下方九宫主将颜色决定，可能是红也可能是黑。
+
 ```python
-bot_red - bot_blk > top_red - top_blk → red_bottom=True
+detect_both_sides(grid_raw) → (our_side, opp_side)
+  # 下半九宫 row 7-9, col 3-5 找主将：@ → red，# → black
+  # 下半漏检则用上半九宫对立面；两边都没有则用半场 row5-9 的 @/# 多数兜底
+detect_our_side(grid_raw) → "red" | "black" | None
+detect_red_bottom(grid_raw) → bool   # 兼容旧调用：our_side == "red"
 ```
-即"图下方红多黑少"时认为红方在用户视角下方（`view_side='red'`），否则 `view_side='black'`。
 
-这个判断只在 **红黑双方底线同时完整** 时可靠。残局（一方底线丢子）时可能判反，但此时引擎决策也会受乱局影响。
+`analyze_array` / `analyze_image` 在推断兵种前调用 `detect_our_side`，写入 `Analysis.side` / `view_side` / `red_bottom`。
+
+残局只要九宫主将还在就可靠；不要再按「上下半场红黑子数」判方向（旧逻辑已废弃）。
 
 ---
 
@@ -225,24 +169,30 @@ BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]
 
 ### 7.4 单格兵种 OCR / 模板（`engine/piece_ocr.py`）
 
-位置先验只做**种子**；残留 `@/#` 一律走墨迹模板：
+近开局可位置种子；其余残留 `@/#` 走 **墨迹 + 彩色** 融合匹配：
 
-1. `extract_cell_ink`：格心红/黑 mask（黑子辅以灰度分位）→ 圆盘裁剪 → 40×40 二值墨迹
-2. `score_cell_types` / `classify_cell_type`：与 `engine/piece_templates/{red,black}/{ch}_*.png` 做 NCC（多份取最高；車馬炮可跨色同字）
-3. `ocr_fill_markers`：叠少量位置加分后按配额贪心分配；仍剩兜底 `R/r`
+1. `extract_cell_ink`：``0.32×cell`` 裁格 → 圆盘 → 正方形补边 → 40×40 二值  
+2. `extract_cell_color`：``0.36×cell`` 圆盘彩色块 → 40×40 BGR  
+3. `score_cell_types`：墨迹 NCC×0.55 + 彩色相关×0.45（无彩色模板则纯墨迹）；每兵种最多较新 8 份；車馬炮可跨色  
+4. `assign_by_scores`：位置先验；top2 分差 &lt;0.08 时先验 ×1.6  
+5. `repair_by_validation`：`validate_grid` 失败时（如 R 超配额、士出九宫）按候选次优重判  
+6. 仍剩 `@/#` 兜底 `R/r`
 
-模板分 `red/`、`black/` 子目录存放，避开 macOS 大小写不敏感导致 `A.png`/`a.png` 互盖。
+近开局种子：完整底线（两端车 + ≥8）全套；或真底线 row0/9 且 ≥7 时只种已占格 + 经典炮/兵位。
 
-采集：`python tools/harvest_piece_templates.py [--clear]`
+自动监听：`analyze_array` 在占用不变时对兵种做最多 3 帧多数投票。
 
-近开局（两端车位都在且同色 ≥8）才种子化完整底线 + 经典 1·7 炮位 / 兵线偶数列；缺角时改走 OCR，避免错位套 RNB…（见 103438）。
-有 OCR 时**不做**残缺底线位置种子（中局 `pick_backrow` 常把 row2/7 误当底线，会把马标成象并占掉将士配额）。
+模板目录：
+- 墨迹 `piece_templates/{red,black}/`
+- 彩色 `piece_templates/color/{red,black}/`
+
+采集：`python tools/harvest_piece_templates.py [--color-only|--ink-only] [--clear]`
 
 ### 7.5 已知缺陷
 
-- 墨迹模板绑定当前 App 棋子字形；换皮肤需 `--clear` 后重采
-- 亮棕底色漏检仍会导致占位缺失，OCR 无法补子
-- 帅/将仅一枚时主要靠九宫位置种子化
+- 模板绑定当前 App 字形与 **782×1332** 布局；换皮/换分辨率需重采  
+- 亮棕漏检仍会导致占位缺失  
+- 彩色模板过多时匹配变慢（已限制每类 8 份）
 
 ---
 
@@ -258,25 +208,31 @@ BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]
 | `grid` | `List[List[str]]` | 推断后的兵种字母 |
 | `grid_str` | `str` | 9 列连续、10 行换行的字符串，直接给引擎 |
 | `red_count` / `black_count` | `int` | 红 / 黑棋子数量 |
-| `red_bottom` | `bool` | 红方是否在图下方 |
-| `view_side` | `str` | `'red'` 或 `'black'`，给引擎的视角参数 |
+| `side` | `str` | 我方颜色（下半九宫主将） |
+| `red_bottom` | `bool` | 兼容字段：`side == "red"` |
+| `view_side` | `str` | 图下方是谁 = 我方（与 `side` 相同） |
 | `row0, col0, cell` | `float` | 网格参数（crop 坐标系） |
 | `cell_center(row, col)` | `(float, float)` | 整图坐标系的格子中心 |
 
 ### 8.2 `analyze_array(img, path="<memory>")` → Analysis
 
-与 `analyze_image` 同一套 ROI → 检测 → 网格 → 推断 → 校验；入参是 **BGR `ndarray`**，不读盘。
+与 `analyze_image` 同一套 **ROI → 固定格网 → classify → infer → 校验**；入参是 **BGR 原图像素**（不读盘，也不使用界面缩放图）。
 
-`ui/app.py` 自动监听每秒一帧走这条路径（`path="<auto>"`），避免频繁磁盘 I/O。触发计算时再把该帧另存为 `images/auto_*.png`，供 `annotate` 与回看。
+`path` 为 `"<auto>"` / `"<memory>"`（或路径含 `auto`）时启用兵种时序投票。`ui/app.py` 自动监听每秒一帧走这条路径，避免频繁磁盘 I/O。默认**不落盘**；「自动截图」拉杆 >0 时写入 `images/auto/auto_*.png` 并环形保留。标注用内存里的 `Analysis.image`。
 
 ### 8.3 `annotate(analysis, decision)` → BGR ndarray
 
-在原图上标注：
+在原图上标注（**前两手都要画**；契约前提：我方先走）：
 1. **所有检出棋子**：黑色矩形描边（BGR `0,0,0`，边长 `0.92×cell`）
-2. 网格线（灰色辅助线）
-3. 对方应手（绿色线 + 起点框 + 黄色终点框）
-4. 我方着法（红色线 + 起点圆 + 蓝色终点圆）
-5. 着法文字说明（左上角半透明黑底 + 红字）
+2. 兵种文字（格角，字色随红/黑）
+3. 合法性违规格：红 X
+4. **棋盘轮廓**：青黄色粗外框 + 四角短角标（半格外扩，便于目检）
+5. 网格线（灰色，可关）；楚河汉界加橙色中线
+6. **第 2 手（对方）** `pv.steps[1]`：绿线 + 绿框起点 + 黄框终点（先画）
+7. **第 1 手（我方）** `pv.steps[0]`：红线 + 红圈起点 + 蓝圈终点（后画，盖上层）
+8. 着法文字说明（左上角半透明黑底）
+
+走位颜色是标注样式，与棋子红黑无关。`from`/`to` 已是图像方向，不要再镜像。
 
 ---
 
@@ -286,8 +242,8 @@ BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]
 |------|------|------|------|
 | 亮棕底色黑子漏检 | 与木纹 HSV 不可分 | 屏幕偏亮 / 压缩 | 底线马位可用 `_repair_backrow_horse_gaps` 补；中局仍可能漏 |
 | 底线兵种推断错位 | 底线漏检导致底线行没被识别出来 | 底线漏检 ≥3 子 | 兵种位置全乱 |
-| 红黑方向判反 | 一方底线严重残缺 | 残局 | 引擎视角错 → 决策方向错 |
-| `find_grid` 抛 "未找到可用网格" | `detect_pieces` 检测到的棋子坐标偏出棋盘区域 | 手机截图变形大 / 棋盘位置偏离 ROI | 直接无法识别 |
+| 我方颜色判反 | 双方九宫主将都漏检或同色误检 | 极端残缺识别 | `view_side` 错 → 决策/标注「我方」反了 |
+| 固定格网整体偏移 | App 改了棋盘边距/分辨率布局 | 换皮或新模拟器边框 | 重测 `_BOARD_*` 三项 |
 | 棋子数量远超 32 | 底线补漏等启发式逻辑错误补空格 | 已删除，但中局漏检仍会被 `infer_pieces` 兜底填 `R/r` 放大 | 引擎局面信息扭曲 |
 
 ---
@@ -296,31 +252,31 @@ BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]
 
 | 尝试 | 结论 | 原因 |
 |------|------|------|
-| HoughCircles 直接在 detect_pieces 里加补漏 | ❌ 废弃 | 产生假圆干扰 find_grid 聚类 |
+| HoughCircles 直接在 detect_pieces 里加补漏 | ❌ 废弃 | 产生假圆；主路径已不用连通域定位 |
 | 底线补漏 "底线 ≥7 枚就把空格全补上" | ❌ 废弃 | 象棋底线并不总是满 9 枚（残局跳马走后真的有空格），Vstd 阈值 15-17 和确定空格无法区分 |
 | 霍夫圆 + 底线位置先验组合 | ❌ 废弃 | 同上，底线不是满的就不该补 |
 | KMeans 极坐标展开检测棋子轮廓 | ❌ 废弃 | 计算量大，对亮棕底色依然无效 |
-| **纯 HSV mask + 底线位置先验（infer_pieces 层）** | ✅ 保留 | 鲁棒、快、漏检只影响个别亮棕黑子 |
+| **纯 HSV mask + 底线位置先验（infer_pieces 层）** | ✅ 保留 | 占用检测仍靠格心 HSV；兵种另有模板 |
+| **棋子聚类搜网格** | ❌ 已移除 | 改为 `_BOARD_*` 固定相对布局 |
+| **墨迹 + 彩色模板 + 校验重判** | ✅ 当前 | 专治马/车易混与 R 超配额 |
 
-**结论**：图像识别无法完美覆盖所有屏幕渲染风格。与其过度"修复"产生假阳性，不如接受亮棕底色黑子会偶尔漏检的事实，让引擎在真实局面上做 alpha-beta 搜索——只要不漏检的不是关键马（就像最初 103438 的情况），引擎的搜索深度足以兜住局面评估偏差。
+**结论**：固定分辨率下格网可写死；兵种靠模板+先验+校验回退。亮棕漏检仍可能发生——与其假阳性补子，不如接受个别漏检，由引擎在真实占用上搜索。换皮/换分辨率需重测 `_BOARD_*` 并重采模板。
 
 ---
 
 ## 11. 坐标系契约（不可打破）
 
 ```
-图像 row 0 = 图最上方
-图像 row 9 = 图最下方
-图像 col 0 = 图最左边
-图像 col 8 = 图最右边
+图像 / grid：row 0 = 图最上，row 9 = 图最下；col 0 = 图左
+我方 = view_side = 图下方（下半九宫主将颜色）
+内部引擎：row 0 = 黑底，row 9 = 红底
 
-引擎 view_side='black' 时：
-  引擎认为自己在红方位置（图上半）
-  输出坐标直接是图像坐标，无需镜像
+decide_position(grid=..., view_side=...)：
+  view_side == black 时先 mirror_grid（旋转 180°）再解析
+  输出 best_move.from/to、pv.steps 已转回图像方向
 
-引擎 view_side='red' 时：
-  引擎认为自己在红方位置（图下半）
-  输出坐标直接是图像坐标
+截图分析调用：
+  side=analysis.view_side, view_side=analysis.view_side  # 我方先走
 ```
 
-所有后续模块（annotate、UI 显示）都基于这个契约做坐标换算。
+`annotate` / UI 推演列表直接用输出坐标与 `pv.sides`；`sides[i] == view_side` 标「我方」，否则「对方」。

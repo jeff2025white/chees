@@ -21,10 +21,15 @@ import numpy as np
 
 from .constants import FEN_TO_PIECE, PIECE_NAMES
 
-# 基准分辨率（本批截图均为 720×1280）的比例参数
+# 基准分辨率（历史手机截图 720×1280；当前 images/* 多为 782×1332 模拟器）
 _REF_W = 720.0
 _REF_H = 1280.0
-_CELL_RATIO = 76.0 / _REF_W          # 格宽 / 图宽
+# 棋盘在整图中的相对布局（images/* 根目录 266 张、hit≥20 中位数标定）
+# 随图宽高缩放；换皮/改布局后需重测
+_BOARD_ROW0_ABS = 0.25443             # 首格中心 Y / 图高
+_BOARD_COL0_ABS = 0.07344             # 首格中心 X / 图宽
+_BOARD_CELL_W = 0.09782               # 格宽 / 图宽
+_CELL_RATIO = _BOARD_CELL_W           # 兼容旧引用
 _ROI_Y0 = 101.0 / _REF_H
 _ROI_Y1 = 1264.0 / _REF_H
 _TOP_UI = 0.075                       # 顶部 UI 屏蔽比例（头像/比分区）
@@ -173,7 +178,7 @@ def _nms_pieces(pieces, min_dist: float):
 
 
 # --------------------------------------------------------------------------
-# 网格定位：在 (row0, col0, cell) 上做评分搜索
+# 网格定位：整图相对固定布局 + 可选原点微调
 # --------------------------------------------------------------------------
 
 def _score_grid(pieces, row0, col0, cell, tol):
@@ -193,182 +198,52 @@ def _score_grid(pieces, row0, col0, cell, tol):
     return score, hit
 
 
-def _cluster(values, gap):
-    """一维聚类（按间隙切分），返回各簇均值。"""
-    vals = np.sort(np.asarray(values, dtype=float))
-    if len(vals) == 0:
-        return np.array([])
-    breaks = np.where(np.diff(vals) > gap)[0]
-    groups, start = [], 0
-    for b in breaks:
-        groups.append(vals[start:b + 1])
-        start = b + 1
-    groups.append(vals[start:])
-    return np.array([g.mean() for g in groups if len(g) > 0])
+def fixed_board_grid(full_w, full_h, crop_y0=0):
+    """按标定比例得到 crop 坐标系下的 (row0, col0, cell)。"""
+    cell = _BOARD_CELL_W * float(full_w)
+    col0 = _BOARD_COL0_ABS * float(full_w)
+    row0 = _BOARD_ROW0_ABS * float(full_h) - float(crop_y0)
+    return float(row0), float(col0), float(cell)
 
 
-def _score_axis(values, origin, cell, count, tol):
-    """单轴评分：values 落在 origin + k*cell 格点上的加权得分。"""
-    score, hit = 0.0, 0
-    for v in values:
-        k = round((v - origin) / cell)
-        if not (0 <= k < count):
-            continue
-        d = abs(v - (origin + k * cell))
-        if d <= tol:
-            score += 1.0 - 0.5 * d / tol
-            hit += 1
-    return score, hit
+def _infer_full_size(crop, crop_y0):
+    """仅传 crop 时反推整图尺寸（假定仍按 _ROI_Y0/_ROI_Y1 裁切）。"""
+    ch, cw = crop.shape[:2]
+    full_w = cw
+    if crop_y0 > 0 and _ROI_Y0 > 1e-6:
+        full_h = int(round(crop_y0 / _ROI_Y0))
+    else:
+        span = max(_ROI_Y1 - _ROI_Y0, 1e-6)
+        full_h = int(round(ch / span))
+    return full_w, max(full_h, ch + crop_y0)
 
 
-def _unit_cells_from_gaps(centers, ref_cell):
-    """把簇间距折算成单位格宽。
-
-    残局相邻占用行常隔 2～3 格，直接取中位间距会把 cell 估大。
-    用 round(d/ref) 还原格数后再取 d/n；ref 仅作分格参考，可略偏。
-    """
-    if len(centers) < 2 or ref_cell <= 1e-6:
-        return []
-    units = []
-    for d in np.diff(np.asarray(centers, dtype=float)):
-        d = float(d)
-        if d < 0.70 * ref_cell or d > 3.60 * ref_cell:
-            continue
-        n = max(1, int(round(d / ref_cell)))
-        unit = d / n
-        if 0.75 * ref_cell <= unit <= 1.25 * ref_cell:
-            units.append(unit)
-    return units
-
-
-def find_grid(crop, pieces=None):
+def find_grid(crop, pieces=None, full_w=None, full_h=None, crop_y0=0):
     """定位 10×9 网格。
 
-    先用棋子坐标聚类估计格宽，再在「哪一簇对应第几行/第几列」上做轴向评分，
-    只有几百次评估（早期版本用全图四重暴力搜索，耗时几十秒）。
+    棋盘在截图中的相对位置固定：用 ``_BOARD_*`` 比例直接算格网，
+    随 ``full_w/full_h`` 缩放。若传入 ``pieces``（连通域中心），再做原点微调。
 
-    残局棋子少时，相邻占用行间距常是 2～3 格；不能直接取中位间距，
-    也不宜锁死「整图宽 × 76/720」——自动截图常含模拟器侧栏，该默认值会偏大，
-    网格整体平移后 OCR 全错。应把多格间距折算成单位格宽后再搜原点。
+    主识别路径不再依赖棋子聚类；``pieces`` 仅用于可选 refine / 诊断打分。
     """
-    if pieces is None:
-        pieces = detect_pieces(crop)
-    if len(pieces) < 6:
-        raise RuntimeError(f"检测到的棋子过少（{len(pieces)}），无法定位棋盘")
+    if full_w is None or full_h is None:
+        fw, fh = _infer_full_size(crop, crop_y0)
+        full_w = full_w or fw
+        full_h = full_h or fh
 
-    h, w = crop.shape[:2]
-    scale = w / _REF_W
-    # 宽度比例默认值：仅作聚类间隙/分格参考；letterbox 截图上会偏大
-    width_cell = _CELL_RATIO * w
+    row0, col0, cell = fixed_board_grid(full_w, full_h, crop_y0=crop_y0)
+    if cell <= 1e-6:
+        raise RuntimeError("固定格网 cell 无效")
 
-    # 排除顶部头像区 / 底部按钮区的杂点
-    y_lo, y_hi = _TOP_UI * h, _BOTTOM_UI * h
-    core = [p for p in pieces if y_lo <= p[1] <= y_hi] or pieces
+    score, hit = 0.0, 0
+    if pieces:
+        ch = crop.shape[0]
+        y_lo, y_hi = _TOP_UI * ch, _BOTTOM_UI * ch
+        core = [p for p in pieces if y_lo <= p[1] <= y_hi] or pieces
+        row0, col0 = _refine_grid_origin(core, row0, col0, cell)
+        score, hit = _score_grid(core, row0, col0, cell, 0.38 * cell)
 
-    rows = _cluster([p[1] for p in core], 0.55 * width_cell)
-    cols = _cluster([p[0] for p in core], 0.55 * width_cell)
-    ys = [p[1] for p in core]
-    xs = [p[0] for p in core]
-
-    # 1 格间距 + 多格间距折算后的单位格宽
-    near = []
-    units = []
-    for seq in (rows, cols):
-        if len(seq) < 2:
-            continue
-        for d in np.diff(seq):
-            d = float(d)
-            if 0.85 * width_cell <= d <= 1.15 * width_cell:
-                near.append(d)
-        units.extend(_unit_cells_from_gaps(seq, width_cell))
-
-    sparse = len(core) < 16
-    if near:
-        base_cell = float(np.median(near))
-    elif units:
-        base_cell = float(np.median(units))
-    else:
-        base_cell = width_cell
-
-    # letterbox 时 width_cell 偏大；有足够间距样本时允许明显低于宽度默认值
-    lo = 0.80 * width_cell if (sparse or len(units) >= 3 or len(near) >= 3) else 0.90 * width_cell
-    hi = 1.15 * width_cell if sparse else 1.10 * width_cell
-    if not (lo <= base_cell <= hi):
-        if units:
-            base_cell = float(np.median(units))
-        elif not near:
-            base_cell = width_cell
-        if not (0.70 * width_cell <= base_cell <= 1.20 * width_cell):
-            base_cell = width_cell
-
-    # 稀疏残局略放宽格宽微调，原点仍靠占用点对齐
-    deltas = (-1.0, -0.5, 0.0, 0.5, 1.0) if not sparse else (
-        -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0)
-    cell_list = [base_cell + d * scale for d in deltas]
-    # 稀疏时若宽度默认与估宽差一截，把宽度默认也纳入候选，避免估偏无退路
-    if sparse and abs(width_cell - base_cell) > 1.5 * scale:
-        cell_list.append(width_cell)
-    tol = 0.38 * base_cell
-
-    def search_axis(values, centers, count):
-        best = (-1.0, 0, None)
-        for cell in cell_list:
-            span = (count - 1) * cell
-            for c in centers:
-                for k in range(count):
-                    origin = c - k * cell
-                    if origin < -2 or origin + span > (h if count == ROWS else w) + 2:
-                        continue
-                    s, ht = _score_axis(values, origin, cell, count, tol)
-                    if ht > best[1] or (ht == best[1] and s > best[0]):
-                        best = (s, ht, (origin, cell))
-        return best
-
-    y_score, y_hit, y_fit = search_axis(ys, rows, ROWS)
-    x_score, x_hit, x_fit = search_axis(xs, cols, COLS)
-
-    if y_fit is None or x_fit is None:
-        raise RuntimeError("未找到可用网格")
-
-    row0, cell_y = y_fit
-    col0, cell_x = x_fit
-    cell = (cell_y + cell_x) / 2.0
-
-    # 二维复核（格宽取两轴平均后再评一次）
-    s2, hit2 = _score_grid(core, row0, col0, cell, tol)
-    if hit2 < min(y_hit, x_hit):
-        cell = cell_y
-        s2, hit2 = _score_grid(core, row0, col0, cell_y, tol)
-
-    # 稀疏残局：用估得的 base_cell（不是偏大的 width_cell）重搜原点
-    if sparse:
-        cell_candidates = [base_cell]
-        if abs(cell - base_cell) > 0.5 * scale:
-            cell_candidates.append(cell)
-        if abs(width_cell - base_cell) > 1.5 * scale:
-            cell_candidates.append(width_cell)
-        best = (hit2, s2, row0, col0, cell)
-        for cand in cell_candidates:
-            tol_s = 0.38 * cand
-            for c in rows:
-                for k in range(ROWS):
-                    r0 = float(c - k * cand)
-                    if r0 < -2 or r0 + 9 * cand > h + 2:
-                        continue
-                    for x in cols:
-                        for j in range(COLS):
-                            c0 = float(x - j * cand)
-                            if c0 < -2 or c0 + 8 * cand > w + 2:
-                                continue
-                            sc, ht = _score_grid(core, r0, c0, cand, tol_s)
-                            if ht > best[0] or (ht == best[0] and sc > best[1]):
-                                best = (ht, sc, r0, c0, cand)
-        hit2, s2, row0, col0, cell = best
-
-    # 用已对齐的棋子反推原点，减小整体平移（透视/边距）
-    row0, col0 = _refine_grid_origin(core, row0, col0, cell)
-
-    return row0, col0, cell, s2, hit2
+    return row0, col0, cell, score, hit
 
 
 def _refine_grid_origin(pieces, row0, col0, cell):
@@ -390,9 +265,10 @@ def _refine_grid_origin(pieces, row0, col0, cell):
 # --------------------------------------------------------------------------
 
 def classify(crop, row0, col0, cell):
-    """返回 (grid_raw, centers)：'@'=红 '#'=黑 '.'=空。
+    """按固定格心采样占用：返回 (grid_raw, centers)，'@'=红 '#'=黑 '.'=空。
 
-    格心用红/暗黑 mask；随后对底线马位做间隙修复，补亮棕黑子漏检。
+    主路径不再依赖连通域找子；空格（双 mask 都很低）直接 '.'，供后续 OCR 跳过。
+    随后对底线马位做间隙修复，补亮棕黑子漏检。
     """
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     h, w = crop.shape[:2]
@@ -413,6 +289,10 @@ def classify(crop, row0, col0, cell):
                 continue
             rr = float(red_mask[y0:y1, x0:x1].mean())
             br = float(black_mask[y0:y1, x0:x1].mean())
+            # 空格快路径：双色都极低则不必走阈值比较
+            if rr < 0.015 and br < 0.015:
+                line.append(".")
+                continue
             line.append(_cell_color(rr, br))
         grid.append(line)
     _repair_backrow_horse_gaps(grid)
@@ -472,19 +352,34 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
     red_full = backrow_complete(red_back, "@")
     black_full = backrow_complete(black_back, "#")
 
-    # 近开局：两端车位在且 ≥8 才套完整底线模板，并填经典炮/兵位
-    if red_full:
+    def seed_backrow_occupied(back, marker, letters, require_full):
+        """近开局底线种子：完整底线全套；否则 ≥7 且真底线时只种占用格。"""
+        if back is None:
+            return False
+        if require_full:
+            if not backrow_complete(back, marker):
+                return False
+            for c in range(COLS):
+                if grid[back][c] == marker:
+                    grid[back][c] = letters[c]
+            return True
+        # 扩展：仅真正底线 row0/9，占用 ≥7，按列字母种已占格（缺角不瞎套空位）
+        if back not in (0, ROWS - 1):
+            return False
+        n = sum(1 for c in range(COLS) if grid[back][c] == marker)
+        if n < 7:
+            return False
         for c in range(COLS):
-            if grid[red_back][c] == "@":
-                grid[red_back][c] = RED_BACKROW[c]
-    if black_full:
-        for c in range(COLS):
-            if grid[black_back][c] == "#":
-                grid[black_back][c] = BLACK_BACKROW[c]
+            if grid[back][c] == marker:
+                grid[back][c] = letters[c]
+        return True
 
-    def fill_cannon_pawn(backrow, marker, cannon, pawn):
+    def fill_cannon_pawn(backrow, marker, cannon, pawn, require_full_back):
         if backrow is None:
             return
+        if require_full_back and not backrow_complete(backrow, marker):
+            # 半开局：仍可种经典炮/兵位（格上仍是占位符时）
+            pass
         step = 1 if backrow <= 4 else -1
         cannon_row, pawn_row = backrow + 2 * step, backrow + 3 * step
         if 0 <= cannon_row < ROWS:
@@ -496,14 +391,19 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
                 if grid[pawn_row][c] == marker:
                     grid[pawn_row][c] = pawn
 
-    if red_full:
-        fill_cannon_pawn(red_back, "@", "C", "P")
-    if black_full:
-        fill_cannon_pawn(black_back, "#", "c", "p")
+    seeded_red = seed_backrow_occupied(red_back, "@", RED_BACKROW, require_full=True)
+    if not seeded_red:
+        seeded_red = seed_backrow_occupied(red_back, "@", RED_BACKROW, require_full=False)
+    seeded_blk = seed_backrow_occupied(black_back, "#", BLACK_BACKROW, require_full=True)
+    if not seeded_blk:
+        seeded_blk = seed_backrow_occupied(black_back, "#", BLACK_BACKROW, require_full=False)
 
-    # 单格 OCR：填充所有残留 @/#
-    # 有 OCR 时不做「残缺底线」位置种子——pick_backrow 在中局常把 row2/7
-    # 误当成底线，会把马标成象、把将士配额占掉（见 112752）。
+    if seeded_red or red_full:
+        fill_cannon_pawn(red_back, "@", "C", "P", require_full_back=red_full)
+    if seeded_blk or black_full:
+        fill_cannon_pawn(black_back, "#", "c", "p", require_full_back=black_full)
+
+    # 单格 OCR：填充所有残留 @/#；校验失败按候选次优重判
     can_ocr = (
         crop is not None and row0 is not None and col0 is not None and cell is not None
     )
@@ -512,9 +412,9 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
             grid, crop, row0, col0, cell, side,
             piece_masks_fn=_piece_masks,
             elephant_valid_fn=_valid_elephant_positions,
+            validate_fn=validate_grid,
         )
     else:
-        # 无图时才用残缺底线种子；且只允许真正底线 row0/9，禁止 row2/7
         def seed_partial_backrow(back, marker, backrow_letters):
             if back is None or back not in (0, ROWS - 1) or backrow_complete(back, marker):
                 return
@@ -786,6 +686,46 @@ def analyze_image(path):
     return analyze_array(img, path=path)
 
 
+# 自动监听：同占用图下兵种时序投票（最多 3 帧）
+_TYPE_VOTE_BUF = []  # [(occ_key, grid_copy), ...]
+_TYPE_VOTE_MAX = 3
+
+
+def _occupancy_key(grid_raw):
+    return tuple("".join(row) for row in grid_raw)
+
+
+def _vote_piece_types(grid, grid_raw):
+    """占用不变时，对字母格做多数投票，抑制 OCR 闪错。"""
+    global _TYPE_VOTE_BUF
+    key = _occupancy_key(grid_raw)
+    gcopy = [list(row) for row in grid]
+    _TYPE_VOTE_BUF = [(k, g) for (k, g) in _TYPE_VOTE_BUF if k == key]
+    _TYPE_VOTE_BUF.append((key, gcopy))
+    if len(_TYPE_VOTE_BUF) > _TYPE_VOTE_MAX:
+        _TYPE_VOTE_BUF = _TYPE_VOTE_BUF[-_TYPE_VOTE_MAX:]
+    if len(_TYPE_VOTE_BUF) < 2:
+        return grid
+    out = [list(row) for row in grid]
+    for r in range(ROWS):
+        for c in range(COLS):
+            if grid_raw[r][c] == ".":
+                continue
+            votes = {}
+            for _k, g in _TYPE_VOTE_BUF:
+                ch = g[r][c]
+                if ch in (".", "@", "#"):
+                    continue
+                votes[ch] = votes.get(ch, 0) + 1
+            if not votes:
+                continue
+            # 多数；平票保留当前
+            best = max(votes.items(), key=lambda kv: (kv[1], kv[0] == out[r][c]))
+            if best[1] >= 2:
+                out[r][c] = best[0]
+    return out
+
+
 def analyze_array(img, path="<memory>"):
     """直接从内存中的 BGR ndarray 识别（不落盘）。
 
@@ -796,14 +736,20 @@ def analyze_array(img, path="<memory>"):
     crop = img[y0:y1, 0:w]
     box = (0, y0, w, y1)
 
-    pieces = detect_pieces(crop)
-    row0, col0, cell, score, hit = find_grid(crop, pieces)
+    # 固定相对布局 → 格心 classify（不再先连通域找子）
+    row0, col0, cell, _score, _hit = find_grid(
+        crop, pieces=None, full_w=w, full_h=h, crop_y0=y0)
     grid_raw, _centers = classify(crop, row0, col0, cell)
+    hit = sum(1 for row in grid_raw for ch in row if ch != ".")
+    score = float(hit)
 
     # 在下方九宫主将确定我方颜色
     side = detect_our_side(grid_raw) or "red"
 
     grid = infer_pieces(grid_raw, side=side, crop=crop, row0=row0, col0=col0, cell=cell)
+    # 路径含 auto / memory 时做时序投票（打开单张图不投票，避免污染）
+    if path in ("<auto>", "<memory>") or (isinstance(path, str) and "auto" in path):
+        grid = _vote_piece_types(grid, grid_raw)
     valid, _msgs, violations = validate_grid(grid, side=side)
     return Analysis(path, img, box, row0, col0, cell, grid_raw, grid,
                     score, hit, side, valid=valid, violations=violations)
@@ -940,13 +886,34 @@ def annotate(analysis, decision, draw_grid=True):
         cv2.line(vis, (cx + half, cy - half), (cx - half, cy + half),
                  (0, 0, 255), 3)
 
+    # --- 识别棋盘外轮廓（半格外扩，便于目检格网是否贴合）---
+    board_l = int(round(x0 + a.col0 - cell / 2))
+    board_r = int(round(x0 + a.col0 + (COLS - 1) * cell + cell / 2))
+    board_t = int(round(y0 + a.row0 - cell / 2))
+    board_b = int(round(y0 + a.row0 + (ROWS - 1) * cell + cell / 2))
+    # 青色粗框 = 棋盘轮廓；四角再画短角标，避免和网格线混淆
+    cv2.rectangle(vis, (board_l, board_t), (board_r, board_b), (255, 220, 0), 3)
+    corner = max(10, int(cell * 0.35))
+    thick = 3
+    for cx, cy, dx, dy in (
+        (board_l, board_t, 1, 1),
+        (board_r, board_t, -1, 1),
+        (board_l, board_b, 1, -1),
+        (board_r, board_b, -1, -1),
+    ):
+        cv2.line(vis, (cx, cy), (cx + dx * corner, cy), (255, 220, 0), thick)
+        cv2.line(vis, (cx, cy), (cx, cy + dy * corner), (255, 220, 0), thick)
+
     if draw_grid:
         for r in range(ROWS + 1):
-            y = int(y0 + a.row0 - cell / 2 + r * cell)
-            cv2.line(vis, (x0, y), (x1, y), (90, 90, 90), 1)
+            y = int(round(y0 + a.row0 - cell / 2 + r * cell))
+            cv2.line(vis, (board_l, y), (board_r, y), (90, 90, 90), 1)
         for c in range(COLS + 1):
-            x = int(x0 + a.col0 - cell / 2 + c * cell)
-            cv2.line(vis, (x, y0), (x, y1), (90, 90, 90), 1)
+            x = int(round(x0 + a.col0 - cell / 2 + c * cell))
+            cv2.line(vis, (x, board_t), (x, board_b), (90, 90, 90), 1)
+        # 楚河汉界（row4 / row5 之间）加一条稍亮的中线，便于核对行对齐
+        river_y = int(round(y0 + a.row0 + 4.5 * cell))
+        cv2.line(vis, (board_l, river_y), (board_r, river_y), (0, 180, 255), 2)
 
     best = decision.get("best_move") if decision else None
     if best:

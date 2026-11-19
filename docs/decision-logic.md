@@ -48,7 +48,12 @@ decide_position(
 ```json
 {
   "ok": true,
-  "input": { "fen", "grid", "side_to_move", "in_check", "legal_move_count" },
+  "input": {
+    "fen", "grid",
+    "side_to_move",           // 当前行棋方
+    "our_side", "view_side",  // 均为图下方「我方」，勿写成 side_to_move
+    "in_check", "legal_move_count"
+  },
   "coordinate_contract": { "cols": 9, "rows": 10, ... },
   "status": "playing" | "check" | "checkmate" | "stalemate",
   "best_move": {
@@ -73,14 +78,14 @@ decide_position(
     ]
   },
   "search": {
-    "depth": 6, "nodes": 123456, "time_ms": 3820,
+    "depth": 7, "nodes": 123456, "time_ms": 3820,
     "score_cp": 35, "mate_in": null, "book": false
   },
   "message": "出动炮，抢占要道、增强进攻子力。；占据中路要点。"
 }
 ```
 
-`input` 另含 `our_side` / `view_side`（均为图下方「我方」）与 `side_to_move`。
+分析页：`pv` 长度应约等于迭代深度；`sides[i] == view_side` 为「我方」。对弈页 `fill_pv=False` 时 PV 可很短。
 
 ---
 
@@ -474,19 +479,25 @@ root_search(d):
 
 ### 5.8 主变提取 extract_pv
 
-从 TT 里走一条链：
+目标长度 `max_len`（通常等于本轮达到深度）。优先跟 TT；断链时按 `fill` 处理：
 
 ```python
-extract_pv(first_move, max_len=6):
+extract_pv(first_move, max_len=depth, fill=True):
+  # fill=True（分析）：TT 断了则浅层 root_search 续搜，禁止默默截成一步
+  # fill=False（对弈）：只跟 TT，断了就停
   board = clone()
   move = first_move
-  for _ in range(max_len):
+  for ply in range(max_len):
+    if move 非法:
+      if not fill: break
+      move = 浅层续搜(1..min(剩余, 3))
     pv.append(move)
     board.apply(move)
-    entry = TT[board.hash]          # 取 TT 中记录的最佳着法
-    move = entry[3] if entry else None
+    move = TT[board.hash].best or None
   return pv
 ```
+
+开局库命中时：`decide_position` 第 1 手用库，且 `fill_pv=True` 时对后续局面再 `search` 把主变补到 `max_depth`。
 
 ### 5.9 评分约定
 
@@ -691,8 +702,8 @@ ui/app.py（截图分析）  ui/play.py（人机对弈）
 
 ### 12.1 结论先行
 
-1. **人机对弈默认“深度 6”是最大迭代深度，不是保证完成 6 层。** 引擎从 1 层开始逐层加深，并根据剩余时间和上一层耗时决定是否继续。
-2. `ui/play.py` 在深度 6 时传入的搜索预算是 **7.5 秒**，不是固定每次计算 10 秒。实际墙钟时间还包含合法性检查、开局库、结果解释、坐标转换、线程排队与界面刷新，并受超时检测粒度和系统调度影响。
+1. **人机对弈默认“深度 7”是最大迭代深度，不是保证完成 7 层。** 引擎从 1 层开始逐层加深，并根据剩余时间和上一层耗时决定是否继续。
+2. `ui/play.py` 在深度 7 时传入的搜索预算是 **约 18.75 秒**（深度 6 为 7.5 秒），不是固定每次算满预算。实际墙钟时间还包含合法性检查、开局库、结果解释、坐标转换、线程排队与界面刷新，并受超时检测粒度和系统调度影响。native 下默认档通常远早于预算返回。
 3. 2026-11-18 已编译 `engine/_xiangqi.cp310-win_amd64.pyd`，复测 `native_available=True`。默认 `search()` 现在优先走 **`engine._xiangqi` Cython 原生核**；只有扩展不存在或无法导入的环境才回退到 `search_python()`。已经运行的旧界面需要重启后才能加载新扩展。
 4. 对弈路径明确设置 `top_n=0, fill_pv=False`，因此**不做备选着法复核、不启用吃子/布局软偏好，也不为补全长主变额外续搜**。主要耗时在 Negamax + 静态搜索的节点展开，而不是界面绘图。
 5. 开局库命中时对弈路径直接返回库着法，可能接近瞬时；脱库后的复杂中局更可能用满搜索预算。因此“每次约 10 秒”应理解为当前一批局面的体感范围，不是所有局面的固定耗时。
@@ -753,8 +764,8 @@ ui/app.py（截图分析）  ui/play.py（人机对弈）
 |---:|---:|---|
 | 2～4 | 2.5 秒 | 下限保护 |
 | 5 | 3.0 秒 | `1.2 × 2.5` |
-| 6 | 7.5 秒 | 当前默认值 |
-| 7 | 18.75 秒 | 预算明显增长 |
+| 6 | 7.5 秒 | 旧默认档 |
+| 7 | 18.75 秒 | 当前默认值（native 后由 6 上调） |
 | 8～12 | 30 秒 | 达到封顶 |
 
 每一层开始前还有独立的“是否值得继续加深”判断：
@@ -815,7 +826,7 @@ TT 最佳着法
 - 被将军时展开全部合法应着，没有应着则按杀棋计分；
 - 普通局面的递归上限为 `max_depth+2`，被将军时为 `max_depth+4`。
 
-所以界面显示深度 6 时，战术分支可能继续向下展开，实际节点数不只由“6 层”决定。
+所以界面显示深度 7 时，战术分支可能继续向下展开，实际节点数不只由“7 层”决定。
 
 静态评估由两部分组成：
 
@@ -839,7 +850,7 @@ TT 最佳着法
 
 ### 12.6 本机独立测量：Python 基线与 native 复测
 
-为隔离开局库影响，2026-11-18 在当前工作区直接调用 `search()`，使用与对弈默认档一致的 `time_limit=7.5, max_depth=6, top_n=0, fill_pv=False`，局面为红方炮二平五后轮到黑方。
+为隔离开局库影响，2026-11-18 在当前工作区直接调用 `search()`，使用当时对弈档参数 `time_limit=7.5, max_depth=6, top_n=0, fill_pv=False`（之后默认深度已上调为 7，预算约 18.75s），局面为红方炮二平五后轮到黑方。
 
 编译扩展前的纯 Python 基线：
 
@@ -881,7 +892,7 @@ Native    0.030s   nodes=21,084   move=(64,65)   score=0
 
 ### 12.7 如何理解此前“一次约 10 秒”
 
-在纯 Python 路径下，默认档搜索预算为 7.5 秒，复杂中局可能接近或用满预算；此外还有以下非固定差额：
+在纯 Python 路径下，深度 6 预算 7.5 秒、深度 7（当前默认）约 18.75 秒，复杂中局可能接近或用满预算；此外还有以下非固定差额：
 
 - 每 512 个节点才检查一次时钟，超时后还要沿递归栈退出；
 - 搜索前的状态检查，以及搜索后的解释、PV 校验、坐标和记谱转换，发生在 `Searcher.start` 的纯搜索计时之外；
@@ -946,12 +957,12 @@ Native    0.030s   nodes=21,084   move=(64,65)   score=0
         └─ _auto_calc_worker(已有 Analysis, 当前深度)  # 计算不依赖落盘
               ├─ decide_position(grid, side=view_side, view_side=view_side,
               │                  time_limit=min(90,max(4,2.5·3^(d-4))),
-              │                  max_depth=d, top_n=0)
+              │                  max_depth=d, top_n=0)   # 默认 fill_pv=True
               ├─ annotate → queue
               └─ finally: _computing.clear()  # 恢复截帧
 ```
 
-局面未变时只写一行状态日志，不重复搜索。特效检测命令行：`python test/detect_fx_overlay.py images/`。
+默认迭代深度 7。局面未变时只写一行状态日志，不重复搜索。特效检测命令行：`python test/detect_fx_overlay.py images/`。
 
 ### 13.3 与手动「计算」的差异
 
