@@ -460,8 +460,8 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
                     counts[ch] = counts.get(ch, 0) + 1
         changed = False
 
-        # 1) 超配额：把多余的换成次优合法兵种
-        for ch, (_lo, hi) in TYPE_QUOTA.items():
+        # 1) 超配额：把多余的换成次优合法兵种（TYPE_QUOTA 存的是上限 int）
+        for ch, hi in TYPE_QUOTA.items():
             excess = counts.get(ch, 0) - hi
             if excess <= 0:
                 continue
