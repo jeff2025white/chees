@@ -309,8 +309,8 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
     side: 我方颜色，"red" 表示红方在下（row 9），"black" 表示黑方在下。
     若 side=None，用 detect_our_side(grid_raw) 自动识别。
 
-    有 crop 时：近开局（底线≥8）仍位置种子；其余一律 ``piece_ocr``。
-    无 crop 时才对真正底线 row0/9 做残缺九宫/象位种子。
+    仅近开局（双方子力近满 + 完整底线）才位置种子；中局一律 OCR/CNN。
+    禁止把残留占位无脑兜成车。
     """
     from . import piece_ocr
 
@@ -318,6 +318,8 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
     if side is None:
         side = detect_our_side(grid_raw) or "red"
     red_bottom = (side == "red")
+    red_n = sum(1 for row in grid for ch in row if ch == "@")
+    black_n = sum(1 for row in grid for ch in row if ch == "#")
     red_rows = [sum(1 for ch in row if ch == "@") for row in grid]
     black_rows = [sum(1 for ch in row if ch == "#") for row in grid]
 
@@ -337,12 +339,7 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
     black_back = pick_backrow(black_rows, red_bottom)
 
     def backrow_complete(back, marker):
-        """近开局完整底线：两端车位都在，且同色 ≥8。
-
-        缺角（如只有 ``.@@@@@@@@``）时不能套 RNB… 模板，否则会把错位的
-        车标成马、占掉马配额，真马再被兜成车（见 103438）。
-        缺马（``R.BAKABNR`` / ``RNBAKAB.R``）两端仍在，可以安全套模板。
-        """
+        """近开局完整底线：两端车位都在，且同色 ≥8。"""
         if back is None:
             return False
         if grid[back][0] != marker or grid[back][8] != marker:
@@ -351,9 +348,10 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
 
     red_full = backrow_complete(red_back, "@")
     black_full = backrow_complete(black_back, "#")
+    # 近开局门控：双方都接近满盘且至少一方底线完整，才允许位置种子
+    near_opening = (red_n >= 14 and black_n >= 14 and (red_full or black_full))
 
     def seed_backrow_occupied(back, marker, letters, require_full):
-        """近开局底线种子：完整底线全套；否则 ≥7 且真底线时只种占用格。"""
         if back is None:
             return False
         if require_full:
@@ -363,23 +361,11 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
                 if grid[back][c] == marker:
                     grid[back][c] = letters[c]
             return True
-        # 扩展：仅真正底线 row0/9，占用 ≥7，按列字母种已占格（缺角不瞎套空位）
-        if back not in (0, ROWS - 1):
-            return False
-        n = sum(1 for c in range(COLS) if grid[back][c] == marker)
-        if n < 7:
-            return False
-        for c in range(COLS):
-            if grid[back][c] == marker:
-                grid[back][c] = letters[c]
-        return True
+        return False
 
-    def fill_cannon_pawn(backrow, marker, cannon, pawn, require_full_back):
+    def fill_cannon_pawn(backrow, marker, cannon, pawn):
         if backrow is None:
             return
-        if require_full_back and not backrow_complete(backrow, marker):
-            # 半开局：仍可种经典炮/兵位（格上仍是占位符时）
-            pass
         step = 1 if backrow <= 4 else -1
         cannon_row, pawn_row = backrow + 2 * step, backrow + 3 * step
         if 0 <= cannon_row < ROWS:
@@ -391,19 +377,14 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
                 if grid[pawn_row][c] == marker:
                     grid[pawn_row][c] = pawn
 
-    seeded_red = seed_backrow_occupied(red_back, "@", RED_BACKROW, require_full=True)
-    if not seeded_red:
-        seeded_red = seed_backrow_occupied(red_back, "@", RED_BACKROW, require_full=False)
-    seeded_blk = seed_backrow_occupied(black_back, "#", BLACK_BACKROW, require_full=True)
-    if not seeded_blk:
-        seeded_blk = seed_backrow_occupied(black_back, "#", BLACK_BACKROW, require_full=False)
+    if near_opening:
+        seeded_red = seed_backrow_occupied(red_back, "@", RED_BACKROW, require_full=True)
+        seeded_blk = seed_backrow_occupied(black_back, "#", BLACK_BACKROW, require_full=True)
+        if seeded_red or red_full:
+            fill_cannon_pawn(red_back, "@", "C", "P")
+        if seeded_blk or black_full:
+            fill_cannon_pawn(black_back, "#", "c", "p")
 
-    if seeded_red or red_full:
-        fill_cannon_pawn(red_back, "@", "C", "P", require_full_back=red_full)
-    if seeded_blk or black_full:
-        fill_cannon_pawn(black_back, "#", "c", "p", require_full_back=black_full)
-
-    # 单格 OCR：填充所有残留 @/#；校验失败按候选次优重判
     can_ocr = (
         crop is not None and row0 is not None and col0 is not None and cell is not None
     )
@@ -414,7 +395,7 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
             elephant_valid_fn=_valid_elephant_positions,
             validate_fn=validate_grid,
         )
-    else:
+    elif near_opening:
         def seed_partial_backrow(back, marker, backrow_letters):
             if back is None or back not in (0, ROWS - 1) or backrow_complete(back, marker):
                 return
@@ -429,12 +410,23 @@ def infer_pieces(grid_raw, side=None, crop=None, row0=None, col0=None, cell=None
         seed_partial_backrow(red_back, "@", RED_BACKROW)
         seed_partial_backrow(black_back, "#", BLACK_BACKROW)
 
+    # 仍残留的占位：弱默认兵/卒（有配额），禁止兜成车
+    from .piece_ocr import TYPE_QUOTA
+    counts = {}
+    for row in grid:
+        for ch in row:
+            if ch not in (".", "@", "#"):
+                counts[ch] = counts.get(ch, 0) + 1
     for r in range(ROWS):
         for c in range(COLS):
             if grid[r][c] == "@":
-                grid[r][c] = "R"
+                if counts.get("P", 0) < TYPE_QUOTA["P"]:
+                    grid[r][c] = "P"
+                    counts["P"] = counts.get("P", 0) + 1
             elif grid[r][c] == "#":
-                grid[r][c] = "r"
+                if counts.get("p", 0) < TYPE_QUOTA["p"]:
+                    grid[r][c] = "p"
+                    counts["p"] = counts.get("p", 0) + 1
     return grid
 
 
@@ -718,13 +710,22 @@ def analyze_image(path):
     return analyze_array(img, path=path)
 
 
-# 自动监听：同占用图下兵种时序投票（最多 3 帧）
+# 自动监听：同占用图下兵种时序投票（最多 3 帧）+ 一着迁移
 _TYPE_VOTE_BUF = []  # [(occ_key, grid_copy), ...]
 _TYPE_VOTE_MAX = 3
+_LAST_TRACK = None  # (occ_key, grid_copy)
 
 
 def _occupancy_key(grid_raw):
     return tuple("".join(row) for row in grid_raw)
+
+
+def _occ_color(ch):
+    if ch == "@" or (ch.isupper() and ch != "."):
+        return "R"
+    if ch == "#" or (ch.islower() and ch != "."):
+        return "B"
+    return "."
 
 
 def _vote_piece_types(grid, grid_raw):
@@ -751,10 +752,55 @@ def _vote_piece_types(grid, grid_raw):
                 votes[ch] = votes.get(ch, 0) + 1
             if not votes:
                 continue
-            # 多数；平票保留当前
             best = max(votes.items(), key=lambda kv: (kv[1], kv[0] == out[r][c]))
             if best[1] >= 2:
                 out[r][c] = best[0]
+    return out
+
+
+def _migrate_piece_identity(grid, grid_raw, prev_occ, prev_grid):
+    """占用差分为「同色一格消失、一格出现」时迁移兵种，减少重识别抖动。"""
+    if prev_occ is None or prev_grid is None:
+        return grid
+    disappeared = []
+    appeared = []
+    for r in range(ROWS):
+        for c in range(COLS):
+            oc = _occ_color(prev_occ[r][c])
+            nc = _occ_color(grid_raw[r][c])
+            if oc != nc:
+                if oc != "." and nc == ".":
+                    disappeared.append((r, c, oc))
+                elif oc == "." and nc != ".":
+                    appeared.append((r, c, nc))
+    out = [list(row) for row in grid]
+    if len(disappeared) == 1 and len(appeared) == 1:
+        r0, c0, color0 = disappeared[0]
+        r1, c1, color1 = appeared[0]
+        if color0 == color1:
+            piece = prev_grid[r0][c0]
+            if piece not in (".", "@", "#") and _occ_color(piece) == color0:
+                out[r1][c1] = piece
+    return out
+
+
+def _stabilize_types(grid, grid_raw):
+    """投票 + 相对上一帧的一着迁移。"""
+    global _LAST_TRACK
+    key = _occupancy_key(grid_raw)
+    out = [list(row) for row in grid]
+    if _LAST_TRACK is not None:
+        prev_key, prev_grid = _LAST_TRACK
+        if prev_key == key:
+            out = _vote_piece_types(out, grid_raw)
+        else:
+            out = _migrate_piece_identity(out, grid_raw, prev_key, prev_grid)
+            # 迁移后仍投票缓冲重置为当前
+            global _TYPE_VOTE_BUF
+            _TYPE_VOTE_BUF = [(key, [list(row) for row in out])]
+    else:
+        out = _vote_piece_types(out, grid_raw)
+    _LAST_TRACK = (key, [list(row) for row in out])
     return out
 
 
@@ -768,20 +814,17 @@ def analyze_array(img, path="<memory>"):
     crop = img[y0:y1, 0:w]
     box = (0, y0, w, y1)
 
-    # 固定相对布局 → 格心 classify（不再先连通域找子）
     row0, col0, cell, _score, _hit = find_grid(
         crop, pieces=None, full_w=w, full_h=h, crop_y0=y0)
     grid_raw, _centers = classify(crop, row0, col0, cell)
     hit = sum(1 for row in grid_raw for ch in row if ch != ".")
     score = float(hit)
 
-    # 在下方九宫主将确定我方颜色
     side = detect_our_side(grid_raw) or "red"
 
     grid = infer_pieces(grid_raw, side=side, crop=crop, row0=row0, col0=col0, cell=cell)
-    # 路径含 auto / memory 时做时序投票（打开单张图不投票，避免污染）
     if path in ("<auto>", "<memory>") or (isinstance(path, str) and "auto" in path):
-        grid = _vote_piece_types(grid, grid_raw)
+        grid = _stabilize_types(grid, grid_raw)
     valid, _msgs, violations = validate_grid(grid, side=side)
     return Analysis(path, img, box, row0, col0, cell, grid_raw, grid,
                     score, hit, side, valid=valid, violations=violations)

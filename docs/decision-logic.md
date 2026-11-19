@@ -922,6 +922,8 @@ Native    0.030s   nodes=21,084   move=(64,65)   score=0
 
 按钮文案为「自动监听」/「停止监听」。与手动「打开图片 → 计算」共用同一套 `decide_position` / `annotate` 契约（`side=view_side`，我方先走，推演步数 ≈ 迭代深度，标注前两手）。
 
+识别流水线（格网 / 兵种 CNN / 监听投票与一着迁移）见 [`docs/recognize-logic.md`](recognize-logic.md)；权重 `engine/models/piece_cls.pt`，无 torch 时回退模板 OCR。
+
 ### 13.1 启动条件
 
 | 项 | 行为 |

@@ -1,13 +1,15 @@
-"""单格兵种模板匹配：墨迹 NCC + 彩色块匹配 + 位置先验 + 校验重判。
+"""单格兵种识别：优先 Torch CNN，回退墨迹/彩色模板 NCC。
 
 模板目录（避开 macOS 大小写不敏感冲突）：
     engine/piece_templates/{red,black}/{R,N,...}_*.png          墨迹
     engine/piece_templates/color/{red,black}/{R,N,...}_*.png    彩色 40×40 BGR
+模型权重：
+    engine/models/piece_cls.pt
 
 对外：
     extract_cell_ink / extract_cell_color
     score_cell_types(ink, color_bgr, is_red) -> {ch: score}
-    ocr_fill_markers(...) -> 填充数
+    ocr_fill_markers(...) -> 填充数（Torch 优先）
     repair_by_validation(...) -> 校验失败时按候选分重判
 """
 
@@ -437,12 +439,14 @@ def _scaled_bonus(r, c, ch, side, elephant_valid_fn, *, hard_fail_penalty: float
     return bonus
 
 
-def assign_by_scores(candidates, used_counts, side, elephant_valid_fn, min_raw=0.10):
+def assign_by_scores(candidates, used_counts, side, elephant_valid_fn, min_raw=0.10,
+                     opening_prior: bool = False):
     """candidates: [(r, c, scores_dict, is_red)] → {(r,c): ch}。
 
     两阶段：
       1) 高置信 OCR（margin/分数够）先锁格，先验不得翻盘；
       2) 其余格用缩小后的位置先验做全局贪心。
+    opening_prior=False（中局）时正家位 bonus 置 0，只保留出宫/出田硬罚。
     """
     assignments = {}
     claimed = set()
@@ -482,8 +486,9 @@ def assign_by_scores(candidates, used_counts, side, elephant_valid_fn, min_raw=0
         close = (top - second) < 0.08
         for ch, sc in scores.items():
             bonus = _scaled_bonus(r, c, ch, side, elephant_valid_fn)
-            # 仅在模板分接近时略抬先验，且不再 1.6 倍放大
-            if close:
+            if not opening_prior and bonus > 0:
+                bonus = 0.0
+            if close and opening_prior:
                 bonus *= 1.15
             opts.append((sc + bonus, sc, r, c, ch))
     opts.sort(reverse=True)
@@ -679,22 +684,110 @@ def repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn
     return valid
 
 
-def ocr_fill_markers(grid, crop, row0, col0, cell, side, piece_masks_fn, elephant_valid_fn,
-                     validate_fn=None):
-    """对 grid 中残留的 @/# 做单格 OCR 并写回字母。
-
-    返回 (填充数量, cell_scores)。若传入 validate_fn，填充后做 OCR 冲突修 + 校验重判。
-    """
+def _refine_nr_with_templates(candidates, crop, row0, col0, cell, piece_masks_fn):
+    """车/马易混：CNN 顶为马且模板更像车时，抬高车分压低马分。"""
     templates = load_templates()
     color_templates = load_color_templates()
     if not any(templates.values()) and not any(color_templates.values()):
-        return 0, {}
+        return candidates
     red_mask, black_mask, _ = piece_masks_fn(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV))
-    used = {}
-    for row in grid:
-        for ch in row:
-            if ch not in (".", "@", "#"):
-                used[ch] = used.get(ch, 0) + 1
+    out = []
+    for r, c, scores, is_red in candidates:
+        if not scores:
+            out.append((r, c, scores, is_red))
+            continue
+        n_ch = "N" if is_red else "n"
+        r_ch = "R" if is_red else "r"
+        ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+        top_ch, top_sc = ranked[0]
+        second_sc = ranked[1][1] if len(ranked) > 1 else -1.0
+        # 仅当 CNN 认马，或车马分接近时介入
+        nr_close = (
+            top_ch in (n_ch, r_ch)
+            and scores.get(n_ch, -1) >= 0
+            and scores.get(r_ch, -1) >= 0
+            and abs(scores.get(n_ch, 0) - scores.get(r_ch, 0)) < 0.35
+        )
+        if top_ch != n_ch and not nr_close:
+            out.append((r, c, scores, is_red))
+            continue
+        cx = col0 + c * cell
+        cy = row0 + r * cell
+        ink = extract_cell_ink(crop, red_mask, black_mask, cx, cy, cell, is_red)
+        color_bgr = extract_cell_color(crop, cx, cy, cell)
+        tmpl = score_cell_types(
+            ink, is_red, templates, color_bgr=color_bgr, color_templates=color_templates)
+        if not tmpl:
+            out.append((r, c, scores, is_red))
+            continue
+        tr = tmpl.get(r_ch, -1.0)
+        tn = tmpl.get(n_ch, -1.0)
+        scores = dict(scores)
+        if tr >= tn + 0.04:
+            # 模板更像车：保证车分高于马
+            scores[r_ch] = max(scores.get(r_ch, 0.0), scores.get(n_ch, 0.0) + 0.20)
+            scores[n_ch] = min(scores.get(n_ch, 0.0), scores[r_ch] - 0.12)
+        elif tn >= tr + 0.12 and top_ch == r_ch and top_sc - second_sc < 0.15:
+            # 弱车、模板强马：略抬马（少见，防误伤）
+            scores[n_ch] = max(scores.get(n_ch, 0.0), scores.get(r_ch, 0.0) + 0.05)
+        out.append((r, c, scores, is_red))
+    return out
+
+
+def _score_markers_torch(grid, crop, row0, col0, cell, piece_masks_fn):
+    """优先用 Torch CNN 给残留 @/# 打分；不可用则返回 None。"""
+    from . import piece_model
+
+    if piece_model.load_piece_model() is None:
+        return None
+    red_mask, black_mask, _ = piece_masks_fn(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV))
+    rows, cols = len(grid), len(grid[0]) if grid else 0
+    rad = max(6, int(cell * 0.22))
+    chh, cw = crop.shape[:2]
+    coords = []
+    patches = []
+    flags = []
+    for r in range(rows):
+        for c in range(cols):
+            marker = grid[r][c]
+            if marker not in ("@", "#"):
+                continue
+            is_red = marker == "@"
+            cx = col0 + c * cell
+            cy = row0 + r * cell
+            y0, y1 = max(0, int(cy) - rad), min(chh, int(cy) + rad)
+            x0, x1 = max(0, int(cx) - rad), min(cw, int(cx) + rad)
+            if y1 - y0 >= 4 and x1 - x0 >= 4:
+                rr = float(red_mask[y0:y1, x0:x1].mean())
+                br = float(black_mask[y0:y1, x0:x1].mean())
+                if rr < 0.015 and br < 0.015:
+                    continue
+            color_bgr = extract_cell_color(crop, cx, cy, cell)
+            if color_bgr is None:
+                continue
+            coords.append((r, c, is_red))
+            patches.append(color_bgr)
+            flags.append(is_red)
+    if not patches:
+        return [], {}
+    score_list = piece_model.predict_batch(patches, flags)
+    candidates = []
+    for (r, c, is_red), scores in zip(coords, score_list):
+        if scores:
+            candidates.append((r, c, scores, is_red))
+    candidates = _refine_nr_with_templates(
+        candidates, crop, row0, col0, cell, piece_masks_fn)
+    cell_scores = {(r, c): scores for r, c, scores, _ in candidates}
+    return candidates, cell_scores
+
+
+def _score_markers_templates(grid, crop, row0, col0, cell, piece_masks_fn):
+    """模板 NCC 回退路径。"""
+    templates = load_templates()
+    color_templates = load_color_templates()
+    if not any(templates.values()) and not any(color_templates.values()):
+        return [], {}
+    red_mask, black_mask, _ = piece_masks_fn(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV))
     candidates = []
     cell_scores = {}
     rows, cols = len(grid), len(grid[0]) if grid else 0
@@ -724,20 +817,73 @@ def ocr_fill_markers(grid, crop, row0, col0, cell, side, piece_masks_fn, elephan
             if scores:
                 candidates.append((r, c, scores, is_red))
                 cell_scores[(r, c)] = scores
+    return candidates, cell_scores
+
+
+def _fill_unassigned_best(grid, cell_scores, used, side, elephant_valid_fn):
+    """残留 @/#：按候选分填合法次优，禁止无脑兜成车。"""
+    rows, cols = len(grid), len(grid[0]) if grid else 0
+    for r in range(rows):
+        for c in range(cols):
+            marker = grid[r][c]
+            if marker not in ("@", "#"):
+                continue
+            scores = cell_scores.get((r, c))
+            if not scores:
+                # 无分数时宁可不猜车：用兵/卒作弱默认（配额允许）
+                weak = "P" if marker == "@" else "p"
+                if used.get(weak, 0) < TYPE_QUOTA.get(weak, 0):
+                    grid[r][c] = weak
+                    used[weak] = used.get(weak, 0) + 1
+                continue
+            ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+            for ch, _sc in ranked:
+                if used.get(ch, 0) >= TYPE_QUOTA.get(ch, 0):
+                    continue
+                if not _position_hard_ok(r, c, ch, side, elephant_valid_fn):
+                    continue
+                grid[r][c] = ch
+                used[ch] = used.get(ch, 0) + 1
+                break
+
+
+def ocr_fill_markers(grid, crop, row0, col0, cell, side, piece_masks_fn, elephant_valid_fn,
+                     validate_fn=None):
+    """对 grid 中残留的 @/# 做单格 OCR 并写回字母。
+
+    优先 Torch CNN；不可用则模板 NCC。返回 (填充数量, cell_scores)。
+    """
+    used = {}
+    for row in grid:
+        for ch in row:
+            if ch not in (".", "@", "#"):
+                used[ch] = used.get(ch, 0) + 1
+
+    torch_pack = _score_markers_torch(grid, crop, row0, col0, cell, piece_masks_fn)
+    if torch_pack is not None:
+        candidates, cell_scores = torch_pack
+    else:
+        candidates, cell_scores = _score_markers_templates(
+            grid, crop, row0, col0, cell, piece_masks_fn)
+    if not candidates and not cell_scores:
+        return 0, {}
+
+    # Torch 概率锁阈值略降；模板路径沿用原阈值
+    min_raw = 0.08 if torch_pack is not None else 0.10
+    occ = sum(1 for row in grid for ch in row if ch != ".")
+    letters = sum(1 for row in grid for ch in row if ch not in (".", "@", "#"))
+    # 已种子较多或占位近满 → 开局先验；否则中局只靠模型分
+    opening_prior = (letters >= 20) or (occ >= 28 and letters >= 10)
     filled = 0
-    for (r, c), ch in assign_by_scores(candidates, used, side, elephant_valid_fn).items():
+    for (r, c), ch in assign_by_scores(
+            candidates, used, side, elephant_valid_fn,
+            min_raw=min_raw, opening_prior=opening_prior).items():
         grid[r][c] = ch
         filled += 1
         used[ch] = used.get(ch, 0) + 1
 
     if cell_scores:
-        for r in range(rows):
-            for c in range(cols):
-                if grid[r][c] == "@":
-                    grid[r][c] = "R"
-                elif grid[r][c] == "#":
-                    grid[r][c] = "r"
-        # 先按 OCR 冲突纠正（valid 也适用），再跑规则校验重判
+        _fill_unassigned_best(grid, cell_scores, used, side, elephant_valid_fn)
         repair_by_ocr_conflict(grid, cell_scores, side, elephant_valid_fn)
         if validate_fn is not None:
             repair_by_validation(grid, cell_scores, side, elephant_valid_fn, validate_fn)

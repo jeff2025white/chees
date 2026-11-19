@@ -1,11 +1,11 @@
 # 棋子棋盘识别逻辑文档
 
-代码位置：`engine/recognize.py`
+代码位置：`engine/recognize.py`、`engine/piece_ocr.py`、`engine/piece_model.py`
 
 ## 1. 整体流水线
 
 ```
-截图 (BGR；当前 images/* 多为 782×1332)
+截图 (BGR；标定与主样张为 782×1332 竖屏)
   │
   ▼  [ROI 裁剪]
 crop（上下留缓冲，不全贴棋盘）
@@ -17,16 +17,18 @@ row0/col0/cell ← 整图比例常量 × 宽高（可选 pieces 微调原点）
 90 格 → grid_raw (@/#/.)；空格快路径跳过
   │
   ▼  [detect_our_side + infer_pieces]
-下方九宫主将 → 我方；近开局种子 + 墨迹/彩色 OCR + 校验重判
+下方九宫主将 → 我方；
+近开局才位置种子；其余 → Torch CNN（优先）/ 模板 OCR → 配额分配 → 校验修补
   │
-  ▼  [可选时序投票]（analyze_array / 自动监听）
-占用不变时兵种最多 3 帧多数投票
+  ▼  [监听稳定化]（analyze_array 且 path 含 auto/memory）
+占用不变：最多 3 帧多数投票；
+占用差分为合法一着：迁移兵种身份
   │
   ▼  [Analysis 封装]
 对外 Analysis；annotate 画棋盘轮廓 + 网格 + 前两手
 ```
 
-`detect_pieces`（连通域）仍保留，供诊断或 `find_grid(..., pieces=...)` 微调；主识别路径不再调用。当前 `images/` 根目录截图均为 **782×1332**。
+`detect_pieces`（连通域）仍保留，供诊断或 `find_grid(..., pieces=...)` 微调；主识别路径不再调用。
 
 ---
 
@@ -52,7 +54,7 @@ row0/col0/cell ← 整图比例常量 × 宽高（可选 pieces 微调原点）
 
 主路径已改为格心 `classify`，本函数仅在调试或 `find_grid(..., pieces=...)` 时使用。
 
-HSV 仍分红 / 暗黑两路连通域（亮棕不进 mask，避免整盘木纹）。过滤：面积、边长、圆形度；中心窗口比红黑 mask 定色。亮棕漏检靠 `classify` 后的 `_repair_backrow_horse_gaps`（底线马位间隙修复；马已跳出则禁止补假马）。
+HSV 仍绯红 / 暗黑两路连通域（亮棕不进 mask，避免整盘木纹）。过滤：面积、边长、圆形度；中心窗口比红黑 mask 定色。亮棕漏检靠 `classify` 后的 `_repair_backrow_horse_gaps`（底线马位间隙修复；马已跳出则禁止补假马）。
 
 ---
 
@@ -143,56 +145,77 @@ detect_red_bottom(grid_raw) → bool   # 兼容旧调用：our_side == "red"
 
 ## 7. 兵种推断 `infer_pieces`
 
-### 7.1 定位底线行
+### 7.1 近开局门控（位置种子）
 
-`pick_backrow(counts, prefer_top)` 找到红 / 黑方底线：
-1. 优先在前 3 行（或后 3 行）里找有 ≥7 枚棋子的
-2. 找不到就扫描前 5 行（或后 5 行），取棋子最多且 ≥4 枚的
-3. 再找不到 → 该方底线返回 `None`
+仅当 **双方占用 ≥14** 且 **至少一方底线完整**（两端车位在、同色 ≥8）时，才跑位置种子；**中局禁止**底线/炮/兵硬编码。
 
-### 7.2 底线兵种硬编码
+底线定位仍用 `pick_backrow`（前/后 3 行优先 ≥7，再放宽到半场 ≥4）。
+
+完整底线字母：
 
 ```python
 RED_BACKROW   = ["R", "N", "B", "A", "K", "A", "B", "N", "R"]
 BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]
 ```
-底线行上所有 `@` / `#` 按位置映射到底线字母。
 
-### 7.3 炮 / 兵行推断
+近开局且底线完整时：
 
-找到底线后，往对方方向：
-- 底线 + 2 行 → 炮行（`C/c`）
-- 底线 + 3 行 → 兵行（`P/p`）
-- 其余中局残留 `@/#` → 兜底填 `R/r`
+- 底线按列写入上表
+- 底线 ±2 行经典炮位 `(1,7)` → `C/c`
+- 底线 ±3 行经典兵位 `(0,2,4,6,8)` → `P/p`
 
-`step = 1 if backrow <= 4 else -1`，即底线在上方向下推，底线在下方向上推。
+缺角底线（如 `.@@@@@@@@`）**不**套整行模板（避免错位占配额）。
 
-### 7.4 单格兵种 OCR / 模板（`engine/piece_ocr.py`）
+### 7.2 单格兵种：Torch CNN（优先）+ 模板回退
 
-近开局可位置种子；其余残留 `@/#` 走 **墨迹 + 彩色** 融合匹配：
+代码：`engine/piece_model.py`、`engine/piece_ocr.py`。
 
-1. `extract_cell_ink`：``0.32×cell`` 裁格 → 圆盘 → 正方形补边 → 40×40 二值  
-2. `extract_cell_color`：``0.36×cell`` 圆盘彩色块 → 40×40 BGR  
-3. `score_cell_types`：墨迹 NCC×0.55 + 彩色相关×0.45（无彩色模板则纯墨迹）；每兵种最多较新 8 份；車馬炮可跨色  
-4. `assign_by_scores`：位置先验；top2 分差 &lt;0.08 时先验 ×1.6  
-5. `repair_by_validation`：`validate_grid` 失败时（如 R 超配额、士出九宫）按候选次优重判  
-6. 仍剩 `@/#` 兜底 `R/r`
+残留 `@/#`：
 
-近开局种子：完整底线（两端车 + ≥8）全套；或真底线 row0/9 且 ≥7 时只种已占格 + 经典炮/兵位。
+1. `extract_cell_color` → 圆盘彩色块（模型内 resize 到 **48×48**）+ 第 4 通道 `is_red`
+2. **优先** `engine/models/piece_cls.pt`（TinyCNN，7 类 `RNBAKCP`）**批量** softmax；按占用色写成大小写
+3. 无 torch / 无权重 → 墨迹 NCC×0.55 + 彩色相关×0.45 模板回退（每类最多 8 份；車馬炮可跨色）
+4. **车/马纠偏** `_refine_nr_with_templates`：CNN 顶为马（或车马分接近）且墨迹/彩色模板更像车时，抬高 `R/r`、压低 `N/n`（专治左侧车被认成马）
+5. `assign_by_scores`：高置信锁格 + 配额贪心；将/士九宫、象田字硬约束  
+   - 近开局（已多种子或占位近满）才叠加正「家位」先验  
+   - 中局正家位 bonus=0，避免把中局底线强行判成 `RNBAK…`
+6. `repair_by_ocr_conflict` / `repair_by_validation`  
+7. 仍剩 `@/#`：**弱默认兵/卒**（有配额），**禁止兜成车**
 
-自动监听：`analyze_array` 在占用不变时对兵种做最多 3 帧多数投票。
+### 7.3 自动监听稳定化（`analyze_array`）
 
-模板目录：
-- 墨迹 `piece_templates/{red,black}/`
-- 彩色 `piece_templates/color/{red,black}/`
+路径为 `"<auto>"` / `"<memory>"` 或含 `auto` 时：
 
-采集：`python tools/harvest_piece_templates.py [--color-only|--ink-only] [--clear]`
+| 情况 | 行为 |
+|------|------|
+| 占用不变 | 最多 3 帧兵种多数投票 |
+| 占用差分 = 同色一格消失 + 一格出现 | 把旧格兵种**迁移**到新格 |
+| 吃子（异色替换） | 不迁移，信任新格识别 |
+| 特效帧 | `fx_overlay` 已跳过，跟踪状态不更新 |
+
+### 7.4 训练与数据
+
+```bash
+pip install torch          # 或 pip install -e ".[ml]" / ".[train]"
+python tools/export_piece_dataset.py --clear
+python tools/train_piece_classifier.py --epochs 25
+# → engine/models/piece_cls.pt
+```
+
+数据来源（`export_piece_dataset`）：
+
+- `engine/piece_templates/color/{red,black}/` 彩色模板
+- `test/gt_boards/*.json` 人工全盘/局部标注
+- 开局图位置先验自动切格（占用完整时）
+
+模板回退 / 旧采集仍可用：`tools/harvest_piece_templates.py`。
 
 ### 7.5 已知缺陷
 
-- 模板绑定当前 App 字形与 **782×1332** 布局；换皮/换分辨率需重采  
-- 亮棕漏检仍会导致占位缺失  
-- 彩色模板过多时匹配变慢（已限制每类 8 份）
+- CNN/模板均绑定当前 App 字形与 **782×1332** 布局；换皮或换分辨率需重测 `_BOARD_*` 并重导数据重训
+- 亮棕漏检仍会导致占位缺失（兵种再准也补不回来）
+- 中局若缺 GT，模型易偏开局字形；往 `test/gt_boards/` 加标注后重训即可抬准
+- 无 torch 时回退模板，中局易混对（马/车/炮/卒）仍存在
 
 ---
 
@@ -213,12 +236,13 @@ BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]
 | `view_side` | `str` | 图下方是谁 = 我方（与 `side` 相同） |
 | `row0, col0, cell` | `float` | 网格参数（crop 坐标系） |
 | `cell_center(row, col)` | `(float, float)` | 整图坐标系的格子中心 |
+| `valid` / `violations` | | 合法性校验结果 |
 
 ### 8.2 `analyze_array(img, path="<memory>")` → Analysis
 
 与 `analyze_image` 同一套 **ROI → 固定格网 → classify → infer → 校验**；入参是 **BGR 原图像素**（不读盘，也不使用界面缩放图）。
 
-`path` 为 `"<auto>"` / `"<memory>"`（或路径含 `auto`）时启用兵种时序投票。`ui/app.py` 自动监听每秒一帧走这条路径，避免频繁磁盘 I/O。默认**不落盘**；「自动截图」拉杆 >0 时写入 `images/auto/auto_*.png` 并环形保留。标注用内存里的 `Analysis.image`。
+`path` 为 `"<auto>"` / `"<memory>"`（或路径含 `auto`）时启用 §7.3 稳定化。`ui/app.py` 自动监听每秒一帧走这条路径。默认**不落盘**；「自动截图」拉杆 >0 时写入 `images/auto/` 并环形保留。
 
 ### 8.3 `annotate(analysis, decision)` → BGR ndarray
 
@@ -240,27 +264,29 @@ BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]
 
 | 现象 | 根因 | 出现条件 | 影响 |
 |------|------|------|------|
-| 亮棕底色黑子漏检 | 与木纹 HSV 不可分 | 屏幕偏亮 / 压缩 | 底线马位可用 `_repair_backrow_horse_gaps` 补；中局仍可能漏 |
-| 底线兵种推断错位 | 底线漏检导致底线行没被识别出来 | 底线漏检 ≥3 子 | 兵种位置全乱 |
+| 亮棕底色黑子漏检 | 与木纹 HSV 不可分 | 屏幕偏亮 / 压缩 | 底线马位可间隙补；中局仍可能漏占用 |
+| 中局兵种错（马↔车↔炮） | CNN 缺中局 GT 或模板回退 | 未装 torch / 中局样本少 | 局面扭曲；补 GT 重训 |
 | 我方颜色判反 | 双方九宫主将都漏检或同色误检 | 极端残缺识别 | `view_side` 错 → 决策/标注「我方」反了 |
-| 固定格网整体偏移 | App 改了棋盘边距/分辨率布局 | 换皮或新模拟器边框 | 重测 `_BOARD_*` 三项 |
-| 棋子数量远超 32 | 底线补漏等启发式逻辑错误补空格 | 已删除，但中局漏检仍会被 `infer_pieces` 兜底填 `R/r` 放大 | 引擎局面信息扭曲 |
+| 固定格网整体偏移 | App 改了棋盘边距/分辨率布局 | 换皮、非 782×1332、叠加线截图 | 重测 `_BOARD_*`；错误分辨率图勿当 GT |
+| 开局家位先验污染中局 | 旧逻辑；现已按门控关闭正 bonus | — | 已修：中局 `opening_prior=False` |
 
 ---
 
-## 10. 本次迭代踩坑记录
+## 10. 迭代踩坑记录
 
 | 尝试 | 结论 | 原因 |
 |------|------|------|
 | HoughCircles 直接在 detect_pieces 里加补漏 | ❌ 废弃 | 产生假圆；主路径已不用连通域定位 |
-| 底线补漏 "底线 ≥7 枚就把空格全补上" | ❌ 废弃 | 象棋底线并不总是满 9 枚（残局跳马走后真的有空格），Vstd 阈值 15-17 和确定空格无法区分 |
-| 霍夫圆 + 底线位置先验组合 | ❌ 废弃 | 同上，底线不是满的就不该补 |
-| KMeans 极坐标展开检测棋子轮廓 | ❌ 废弃 | 计算量大，对亮棕底色依然无效 |
-| **纯 HSV mask + 底线位置先验（infer_pieces 层）** | ✅ 保留 | 占用检测仍靠格心 HSV；兵种另有模板 |
-| **棋子聚类搜网格** | ❌ 已移除 | 改为 `_BOARD_*` 固定相对布局 |
-| **墨迹 + 彩色模板 + 校验重判** | ✅ 当前 | 专治马/车易混与 R 超配额 |
+| 底线补漏「底线 ≥7 枚就把空格全补上」 | ❌ 废弃 | 残局底线本可空；假阳性不可接受 |
+| 霍夫圆 + 底线位置先验 | ❌ 废弃 | 同上 |
+| KMeans 极坐标展开 | ❌ 废弃 | 算力大，亮棕仍无效 |
+| 棋子聚类搜网格 | ❌ 已移除 | 改为 `_BOARD_*` 固定相对布局 |
+| 中局仍套底线/炮兵种子 + `@→R` 兜底 | ❌ 已废弃 | 中局兵种全乱、车配额爆炸 |
+| **HSV 格心占用 + 近开局种子** | ✅ 保留 | 占用检测主路径 |
+| **墨迹 + 彩色模板 + 校验重判** | ✅ 回退路径 | 无 torch 时使用 |
+| **Torch TinyCNN + 配额分配 + 监听迁移** | ✅ 当前主路径 | 权重 `engine/models/piece_cls.pt` |
 
-**结论**：固定分辨率下格网可写死；兵种靠模板+先验+校验回退。亮棕漏检仍可能发生——与其假阳性补子，不如接受个别漏检，由引擎在真实占用上搜索。换皮/换分辨率需重测 `_BOARD_*` 并重采模板。
+**结论**：固定竖屏分辨率下格网可写死；兵种以 CNN 为主、模板为辅，规则层只做配额/合法性/时序稳定。亮棕漏检仍可能发生——与其假阳性补子，不如接受个别漏检。换皮/换分辨率：重测 `_BOARD_*` + 重采/重训。
 
 ---
 

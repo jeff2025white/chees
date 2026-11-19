@@ -29,7 +29,16 @@ python test/batch_run.py  # 批量处理 images/，输出到 images/annotated/
 python -m engine          # 引擎命令行
 ```
 
-依赖：`opencv-python`、`numpy`、`pillow`、`tkinter`。
+依赖：`opencv-python`、`numpy`、`pillow`、`tkinter`。兵种 CNN（推荐）：`pip install torch`（见 `[project.optional-dependencies] ml`）。
+
+### 兵种 CNN（可选，准确率更高）
+
+```bash
+pip install torch
+python tools/export_piece_dataset.py --clear
+python tools/train_piece_classifier.py --epochs 25
+# 权重写入 engine/models/piece_cls.pt；未安装 torch 或无权重时自动回退模板 OCR
+```
 
 **macOS 注意**：系统自带 `/usr/bin/python3` 的 Tcl/Tk 8.5 在新系统上会**整窗白屏**。请安装 Homebrew 的 `python-tk`（如 `brew install python@3.14 python-tk@3.14`）。`ui/play.py` / `ui/app.py` 检测到旧 Tk 时会自动切到 `/opt/homebrew/bin/python3*`。
 
@@ -78,10 +87,13 @@ python test/bench_native.py --depth 4
 | `engine/explain.py` | 着法理由、标签 | 分析页 `reason` |
 | `engine/decide.py` | **对外唯一决策入口** | 改返回结构同步改 UI |
 | `engine/recognize.py` | 识别与标注 | `_BOARD_*` 固定格网；`annotate` 含棋盘轮廓 |
+| `engine/piece_model.py` | 兵种 TinyCNN（Torch）加载/批量推理 | 权重 `engine/models/piece_cls.pt` |
+| `engine/piece_ocr.py` | 兵种分配：CNN 优先，模板回退；配额/校验修补 | 禁止残留 `@` 兜成车 |
 | `engine/fx_overlay.py` | 中部特效脏帧检测 | 自动监听跳过；`test/detect_fx_overlay.py` |
 | `ui/app.py` | 截图分析 / 自动监听 | 默认深度 7；`time_limit≈2.5·3^(d-4)`；监听仅 Windows |
 | `ui/play.py` | 人机对弈界面 | 默认深度 7；更短预算；`fill_pv=False` |
 | `test/test_xiangqi_engine.py` | 引擎回归 | 改引擎后必跑 |
+| `test/test_piece_ocr.py` | 兵种 CNN / 开局 GT | 改识别或重训后必跑 |
 | `test/test_ui_smoke.py` | 分析界面冒烟 | 改 UI 后建议跑 |
 | `test/batch_run.py` | 批量识别+决策 | 改识别后主验证 |
 
@@ -159,7 +171,7 @@ vis = annotate(analysis, d)   # 新图，不改原图
 | 想改什么 | 去哪里 |
 |---|---|
 | 识别颜色 / 网格 | `recognize.py` 顶部 `_BOARD_*` 固定布局、`classify` 格心采样 |
-| 兵种推断 | `infer_pieces()` + `piece_ocr`（墨迹+彩色模板、校验重判）；`tools/harvest_piece_templates.py` |
+| 兵种推断 | `infer_pieces()` + `piece_ocr`（**Torch CNN 优先**，回退模板）；`tools/export_piece_dataset.py` + `tools/train_piece_classifier.py` → `engine/models/piece_cls.pt` |
 | 棋力 | `evaluate.py` PST；`search.py` 深度/剪枝；`book.py` |
 | 分析 UI | `ui/app.py` |
 | 对弈 UI / 难度 | `ui/play.py`（默认深度 7） |
@@ -169,14 +181,15 @@ vis = annotate(analysis, d)   # 新图，不改原图
 
 ```bash
 python test/test_xiangqi_engine.py   # 引擎回归
+python test/test_piece_ocr.py        # 兵种 CNN / 开局 GT（需 torch + piece_cls.pt）
 python test/test_ui_smoke.py         # 分析界面冒烟 → images/annotated/ui_window.png
 python test/batch_run.py             # 批量识别+决策
 ```
 
 ## 已知限制
 
-- 兵种：近开局位置种子 + 墨迹/彩色模板融合 + 校验重判；跳马后不再误补底线假马。换皮或换分辨率需重采模板。
-- 亮棕黑子与木纹难分；底线马位可用间隙修复补漏（已跳出则跳过），中局仍可能漏检。
-- 棋盘用 `_BOARD_*` 相对固定布局（当前标定自 782×1332）；App 改边距后需重测。识别在**原图像素**上做，界面缩放只影响显示。
+- 兵种：优先 Torch CNN（`piece_cls.pt`）；无 torch/无权重回退墨迹+彩色模板。仅近开局（双方 ≥14 子且底线完整）才位置种子；中局禁种子、禁 `@→车`。中局准确率依赖 `test/gt_boards/` 标注量，换皮需重导数据重训。
+- 亮棕黑子与木纹难分；底线马位可用间隙修复补漏（已跳出则跳过），中局仍可能漏检占用。
+- 棋盘用 `_BOARD_*` 相对固定布局（当前标定自 **782×1332** 竖屏）；其它分辨率/带叠加线的图会错位。识别在**原图像素**上做，界面缩放只影响显示。
 - 搜索默认优先使用已编译的 Cython 原生核，未编译时回退纯 Python；深度 ≥8 时分析页预算很长，对弈页用更短预算保响应。
-- 「自动监听」仅支持 Windows：置前标题含「手游助手」的窗口，按客户区屏幕截取（DirectX 窗口用 PrintWindow 常黑屏）。
+- 「自动监听」仅支持 Windows：置前标题含「手游助手」的窗口，按客户区屏幕截取（DirectX 窗口用 PrintWindow 常黑屏）；监听态占用不变时投票，合法一着时迁移兵种身份。
