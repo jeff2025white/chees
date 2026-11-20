@@ -59,18 +59,23 @@ cdef int evaluate_board(CBoard* b) noexcept nogil:
                 red_e += 1
             if opening:
                 if ptype == HORSE and sq != 82 and sq != 88:
-                    devel += 18
+                    devel += 22
                 elif ptype == CANNON:
                     if r <= 3:
                         devel -= 80
                     elif c == 4:
-                        devel += 24
+                        devel += 26
                     elif c == 2 or c == 6:
-                        devel += 8
+                        devel += 10
                 elif ptype == PAWN and r == 5 and (c == 0 or c == 2 or c == 4 or c == 6 or c == 8):
-                    devel += 10
-                elif ptype == CHARIOT and r < 9:
-                    devel += 6
+                    devel += 14
+                elif ptype == CHARIOT:
+                    if sq != 81 and sq != 89:
+                        devel += 18
+                        if r < 9:
+                            devel += 12
+                        if r <= 7:
+                            devel += 6
         else:
             if ptype == ADVISOR and r <= 2:
                 black_a += 1
@@ -78,18 +83,23 @@ cdef int evaluate_board(CBoard* b) noexcept nogil:
                 black_e += 1
             if opening:
                 if ptype == HORSE and sq != 1 and sq != 7:
-                    devel -= 18
+                    devel -= 22
                 elif ptype == CANNON:
                     if r >= 6:
                         devel += 80
                     elif c == 4:
-                        devel -= 24
+                        devel -= 26
                     elif c == 2 or c == 6:
-                        devel -= 8
+                        devel -= 10
                 elif ptype == PAWN and r == 4 and (c == 0 or c == 2 or c == 4 or c == 6 or c == 8):
-                    devel -= 10
-                elif ptype == CHARIOT and r > 0:
-                    devel -= 6
+                    devel -= 14
+                elif ptype == CHARIOT:
+                    if sq != 0 and sq != 8:
+                        devel -= 18
+                        if r > 0:
+                            devel -= 12
+                        if r >= 2:
+                            devel -= 6
 
     score += devel
     score += red_a * 12 + red_e * 10

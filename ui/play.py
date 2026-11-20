@@ -36,6 +36,7 @@ PLAY_LOCK = os.path.join(_ROOT, ".play_session.lock")
 
 from engine import decide_position
 from engine.board import Board
+from ui.prefs import get_depth, set_depth
 from engine.constants import (
     BLACK,
     COLS,
@@ -78,7 +79,7 @@ def _fonts(root=None):
     fam = _FONT_FAMILY
     return (fam, 10), (fam, 10, "bold"), (fam, 13, "bold"), fam
 
-WINDOW_W, WINDOW_H = 1024, 768
+WINDOW_W, WINDOW_H = 1064, 768
 
 # 棋盘绘制
 BOARD_BG = "#c9a46a"
@@ -213,7 +214,7 @@ class PlayApp:
         outer.pack(fill="both", expand=True, padx=10, pady=10)
 
         # 先 pack 右侧固定栏，再 pack 左侧 expand，否则右侧会被挤成 0 宽
-        right = tk.Frame(outer, bg=PANEL, width=340)
+        right = tk.Frame(outer, bg=PANEL, width=380)
         right.pack(side="right", fill="y", padx=(10, 0))
         right.pack_propagate(False)
 
@@ -242,11 +243,12 @@ class PlayApp:
 
         depth_box = tk.Frame(right, bg=PANEL)
         depth_box.pack(fill="x", padx=16, pady=(6, 0))
-        self.lbl_depth = tk.Label(depth_box, text="难度：7（深度 7 层）",
+        _depth0 = get_depth()
+        self.lbl_depth = tk.Label(depth_box, text=f"难度：{_depth0}（深度 {_depth0} 层）",
                                   bg=PANEL, fg=FG, font=ui_font, anchor="w")
         self.lbl_depth.pack(fill="x")
 
-        self.depth_var = tk.IntVar(value=7)
+        self.depth_var = tk.IntVar(value=_depth0)
         self.depth_var.trace_add("write", self._on_depth_change)
         self._ensure_scale_style()
         self.scale_depth = ttk.Scale(
@@ -279,6 +281,7 @@ class PlayApp:
     def _on_depth_change(self, *_args):
         d = self.depth_var.get()
         self.lbl_depth.configure(text=f"难度：{d}（深度 {d} 层）")
+        set_depth(d)
 
     def _set_status(self, text):
         self.lbl_status.configure(text=text)

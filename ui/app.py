@@ -39,6 +39,7 @@ if _ROOT not in sys.path:
 from engine import decide_position
 from engine.fx_overlay import detect_board_fx
 from engine.recognize import analyze_array, analyze_image, annotate
+from ui.prefs import get_depth, set_depth
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 BG = "#1f2430"
@@ -59,7 +60,7 @@ AUTO_SAVE_KEEP_MAX = 50
 
 
 # 启动窗口尺寸（物理像素）
-WINDOW_W, WINDOW_H = 1024, 768
+WINDOW_W, WINDOW_H = 1064, 768
 
 
 class FlatButton(tk.Label):
@@ -115,7 +116,7 @@ def _enable_dpi_awareness():
     """让 Tkinter 按物理像素计算窗口尺寸。
 
     Windows 默认会对未声明 DPI 感知的程序做位图拉伸，系统缩放 125%/150% 时
-    geometry("1024x768") 得到的实际像素并非 1024×768。
+    geometry("1064x768") 得到的实际像素并非标称宽高。
     """
     if sys.platform != "win32":
         return
@@ -264,7 +265,7 @@ class ChessApp:
         self.lbl_file.pack(side="left", fill="x", expand=True, padx=8)
 
         # ---------- 右：操作区 ----------
-        right = tk.Frame(outer, bg=PANEL, width=340)
+        right = tk.Frame(outer, bg=PANEL, width=380)
         right.pack(side="right", fill="y", padx=(10, 0))
         right.pack_propagate(False)
 
@@ -287,11 +288,12 @@ class ChessApp:
         # 迭代深度拉杆
         depth_box = tk.Frame(right, bg=PANEL)
         depth_box.pack(fill="x", padx=16, pady=(6, 0))
-        self.lbl_depth = tk.Label(depth_box, text="迭代深度：7 层", bg=PANEL, fg=FG,
+        _depth0 = get_depth()
+        self.lbl_depth = tk.Label(depth_box, text=f"迭代深度：{_depth0} 层", bg=PANEL, fg=FG,
                                   font=UI_FONT, anchor="w")
         self.lbl_depth.pack(fill="x")
 
-        self.depth_var = tk.IntVar(value=7)
+        self.depth_var = tk.IntVar(value=_depth0)
         self.depth_var.trace_add("write", self._on_depth_change)
         self._ensure_scale_style()
         self.scale_depth = ttk.Scale(
@@ -760,7 +762,9 @@ class ChessApp:
         )
 
     def _on_depth_change(self, *_args):
-        self.lbl_depth.configure(text=f"迭代深度：{self.depth_var.get()} 层")
+        d = self.depth_var.get()
+        self.lbl_depth.configure(text=f"迭代深度：{d} 层")
+        set_depth(d)
 
     # ---------------------------------------------------------------- 渲染
     def _render(self):
@@ -891,11 +895,12 @@ class ChessApp:
                     who = "我方" if best.get("color") == our_side else "对方"
                     tag = "move" if who == "我方" else "opp"
                     block.append((tag, f"{best['chinese']}  {who}  {best['iccs']}\n"))
-                block.append(("", f"\n评价 {best['score_text']}"
-                                  f"{' · 将' if best.get('gives_check') else ''}"
-                                  f"{' · 杀' if best.get('is_mate') else ''}\n"))
-                if best.get("reason"):
-                    block.append(("", f"{best['reason']}\n"))
+                block.append(("", "\n"))
+                verdict = decision.get("verdict") or {}
+                self._append_verdict_log(
+                    block,
+                    verdict.get("lines") or [f"评价 {best['score_text']}"],
+                )
                 src = "开局库+" if search_info.get("book") else ""
                 block.append(("", f"{src}深度{search_info.get('depth', 0)}"
                                   f" · {search_info.get('nodes', 0):,}节点"
@@ -928,19 +933,32 @@ class ChessApp:
                     tag = "move" if who == "我方" else "opp"
                     lines.append((tag, f"{best['chinese']}  {who}  {best['iccs']}\n"))
 
-                lines.append(("", f"\n最终评价 {best['score_text']}"
-                                  f"{'  · 将军' if best.get('gives_check') else ''}"
-                                  f"{'  · 绝杀' if best.get('is_mate') else ''}\n"))
+                lines.append(("", "\n"))
+                verdict = decision.get("verdict") or {}
+                self._append_verdict_log(
+                    lines,
+                    verdict.get("lines") or [f"评价 {best['score_text']}"],
+                )
                 src = "开局库+" if search_info.get("book") else ""
                 lines.append(("", f"{src}深度 {search_info.get('depth', 0)} 层"
                                   f" · 推演 {len(pv.get('chinese') or [])} 步"
                                   f" · {search_info.get('nodes', 0):,} 节点"
                                   f" · {search_info.get('time_ms', 0) / 1000:.1f}s\n"))
-                if best.get("reason"):
-                    lines.append(("", f"{best['reason']}\n"))
             else:
                 lines.append(("warn", decision.get("message", "没有可走的着法")))
             self._write_info(lines)
+
+    @staticmethod
+    def _append_verdict_log(parts, verdict_lines):
+        """评价/建议/要点标题用 head（蓝），正文保持默认色。"""
+        for line in verdict_lines:
+            for prefix in ("评价 ", "建议 ", "要点 "):
+                if line.startswith(prefix):
+                    parts.append(("head", prefix))
+                    parts.append(("", line[len(prefix):] + "\n"))
+                    break
+            else:
+                parts.append(("", line + "\n"))
 
     # --------------------------------------------------------------- 工具
     def _write_info(self, parts):

@@ -15,11 +15,12 @@ from engine import decide_position
 from engine.board import Board
 from engine.book import book_entries, book_lines, iccs_to_move, lookup_book
 from engine.constants import BLACK, CHARIOT, HORSE, PIECE_VALUE, RED, START_FEN
-from engine.decide import parse_side
+from engine.decide import endgame_search_budget, parse_side
 from engine.evaluate import evaluate, see_value
 from engine.movegen import game_status, generate_legal, generate_legal_moves, perft
 from engine.notation import chinese_notation, move_to_iccs
-from engine.search import search
+from engine.search import MATE, search
+from engine.verdict import build_verdict, score_for_our_side
 
 MATE_IN_ONE_FEN = "3ak4/8R/5a3/3N5/9/9/9/9/9/3K5 w - - 0 1"
 STALEMATE_FEN = "4k4/3N5/2N6/3N5/9/9/9/9/9/3K5 b - - 0 1"
@@ -186,6 +187,20 @@ class TestDecisionAPI(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_side("green")
 
+    def test_endgame_budget_adds_on_manual_depth(self):
+        """残局加深必须叠在手动深度上，而不是被 12 封顶吃掉。"""
+        d, t = endgame_search_budget(12, max_depth=8, time_limit=10.0)
+        self.assertEqual(d, 11)  # 8+3
+        self.assertEqual(t, 80.0)  # 10 * 2^3
+        d2, t2 = endgame_search_budget(12, max_depth=12, time_limit=10.0)
+        self.assertEqual(d2, 15)  # 12+3，封顶 15
+        self.assertEqual(t2, 80.0)
+        d3, _ = endgame_search_budget(18, max_depth=8, time_limit=10.0)
+        self.assertEqual(d3, 9)  # 8+1
+        d4, t4 = endgame_search_budget(24, max_depth=8, time_limit=10.0)
+        self.assertEqual(d4, 8)
+        self.assertEqual(t4, 10.0)
+
     def test_grid_input_and_view_mirror(self):
         board = Board.from_fen(MATE_IN_ONE_FEN)
         base = decide_position(fen=MATE_IN_ONE_FEN, time_limit=1.0)
@@ -245,6 +260,51 @@ class TestOpeningBook(unittest.TestCase):
         self.assertIn("b3e3", alt_iccs)
 
 
+class TestVerdict(unittest.TestCase):
+    def test_score_flips_to_our_side(self):
+        # 红行棋 +50 → 黑为我方时应为 -50
+        self.assertEqual(score_for_our_side(50, RED, RED), 50)
+        self.assertEqual(score_for_our_side(50, RED, BLACK), -50)
+
+    def test_band_and_summary_our_perspective(self):
+        board = Board.from_fen(START_FEN)
+        best = {"chinese": "炮二平五", "reason": "", "tags": ["quiet"]}
+        v = build_verdict(board, best, score_cp=80, side_to_move=RED,
+                          our_side=RED, from_book=False)
+        self.assertEqual(v["band"], "略优")
+        self.assertIn("我方 +0.80", v["summary"])
+        self.assertIn("开局", v["summary"])
+        self.assertTrue(v["advice"].startswith("先炮二平五") or "炮二平五" in v["advice"])
+
+    def test_black_bottom_our_advantage_wording(self):
+        board = Board.from_fen(START_FEN)
+        board.turn = BLACK
+        best = {"chinese": "炮8平5", "reason": "", "tags": ["book"]}
+        # 行棋方黑，分数 +60（黑优）→ 我方黑仍为略优
+        v = build_verdict(board, best, score_cp=60, side_to_move=BLACK,
+                          our_side=BLACK, from_book=True)
+        self.assertIn("我方 +0.60", v["summary"])
+        self.assertIn("开局库", v["advice"])
+
+    def test_mate_summary_not_vague_advantage(self):
+        board = Board.from_fen(MATE_IN_ONE_FEN)
+        best = {"chinese": "车一进一", "reason": "直接绝杀", "tags": ["mate"],
+                "is_mate": True}
+        v = build_verdict(board, best, score_cp=MATE - 1, side_to_move=RED,
+                          our_side=RED, from_book=False)
+        self.assertEqual(v["band"], "绝杀")
+        self.assertIn("绝杀", v["summary"])
+        self.assertNotIn("优势", v["summary"])
+
+    def test_decide_includes_verdict(self):
+        result = decide_position(fen=START_FEN, time_limit=0.1, max_depth=1)
+        self.assertIn("verdict", result)
+        self.assertIn("lines", result["verdict"])
+        self.assertTrue(result["verdict"]["lines"][0].startswith("评价 "))
+        self.assertTrue(result["search"]["book"])
+        self.assertIn("开局库", result["verdict"]["advice"])
+
+
 class TestOpeningAntiPawnGrab(unittest.TestCase):
     def test_early_cannon_raid_eval_not_rewarded(self):
         """开局炮打中兵后的静态分不应明显高于出车发展。"""
@@ -259,8 +319,19 @@ class TestOpeningAntiPawnGrab(unittest.TestCase):
         raid = base.clone()
         raid.apply(iccs_to_move("e3e7"))  # 炮五进四打中卒
 
-        # 贪打兵不应凭子力领先一截
-        self.assertLessEqual(evaluate(raid) - evaluate(develop), 40)
+        # 贪打兵不应凭子力压过出车
+        self.assertLessEqual(evaluate(raid) - evaluate(develop), 20)
+
+    def test_rook_lateral_develop_beats_sitting(self):
+        """车一平二虽仍在底线，也应比窝在原位更好。"""
+        from engine.book import iccs_to_move
+        base = Board.from_fen(START_FEN)
+        for iccs in ("h3e3", "h10g8", "h1g3", "b10c8"):
+            base.apply(iccs_to_move(iccs))
+        sit = evaluate(base)
+        moved = base.clone()
+        moved.apply(iccs_to_move("i1h1"))
+        self.assertGreater(evaluate(moved), sit + 10)
 
     def test_search_prefers_develop_over_cannon_pawn_grab(self):
         """开局搜索（绕过书）不应首选炮打中卒。"""

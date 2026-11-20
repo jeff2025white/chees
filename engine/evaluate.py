@@ -268,20 +268,27 @@ def evaluate(board) -> int:
             elif ptype == ELEPHANT and r >= 5:
                 red_e += 1
             if opening:
+                # 开局出子规律：快出车 > 出马/中炮 > 挺兵；抑制贪打兵
                 if ptype == HORSE and sq not in (82, 88):
-                    devel += 18
+                    devel += 22
                 elif ptype == CANNON:
                     # 炮入对方兵线：抑制开局贪打兵；中炮加分仅计己方半场
                     if r <= 3:
                         devel -= 80
                     elif c == 4:
-                        devel += 24
+                        devel += 26
                     elif c in (2, 6):
-                        devel += 8
+                        devel += 10
                 elif ptype == PAWN and r == 5 and c in (0, 2, 4, 6, 8):
-                    devel += 10
-                elif ptype == CHARIOT and r < 9:
-                    devel += 6
+                    devel += 14  # 挺兵开线，利出车
+                elif ptype == CHARIOT:
+                    # 车一平二仍在底线，须奖「离开原位」；抬离底线再加分
+                    if sq not in (81, 89):
+                        devel += 18
+                        if r < 9:
+                            devel += 12
+                        if r <= 7:
+                            devel += 6
         else:
             if ptype == ADVISOR and r <= 2:
                 black_a += 1
@@ -289,18 +296,23 @@ def evaluate(board) -> int:
                 black_e += 1
             if opening:
                 if ptype == HORSE and sq not in (1, 7):
-                    devel -= 18
+                    devel -= 22
                 elif ptype == CANNON:
                     if r >= 6:
                         devel += 80
                     elif c == 4:
-                        devel -= 24
+                        devel -= 26
                     elif c in (2, 6):
-                        devel -= 8
+                        devel -= 10
                 elif ptype == PAWN and r == 4 and c in (0, 2, 4, 6, 8):
-                    devel -= 10
-                elif ptype == CHARIOT and r > 0:
-                    devel -= 6
+                    devel -= 14
+                elif ptype == CHARIOT:
+                    if sq not in (0, 8):
+                        devel -= 18
+                        if r > 0:
+                            devel -= 12
+                        if r >= 2:
+                            devel -= 6
 
     score += devel
     score += red_a * 12 + red_e * 10

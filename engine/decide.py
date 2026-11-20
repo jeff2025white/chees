@@ -19,16 +19,21 @@ from .notation import (
     sq_to_iccs,
 )
 from .search import MATE, SearchOutcome, search
+from .verdict import build_verdict
 
 SIDE_NAMES = {RED: "red", BLACK: "black"}
 
-# 残局自动加深：少子局面提高迭代深度与时间预算（上限与 UI 滑条一致）
-_ENDGAME_DEPTH_CAP = 12
+# 残局自动加深：在手动深度之上加层；封顶 = 滑条上限 12 + 最大加成 3
+_ENDGAME_DEPTH_CAP = 15
 _ENDGAME_TIME_CAP = 90.0
 
 
 def endgame_search_budget(piece_count: int, max_depth: int, time_limit: float):
-    """按子数给残局加深度；时间按 2^加成放大，深度封顶 12、时间封顶 90s。"""
+    """按子数在手动 max_depth 上加深度；时间按 2^加成放大。
+
+    加成始终加在传入深度上（≤20 → +1，≤16 → +2，≤12 → +3），
+    再与封顶 15、时间封顶 90s 取小。
+    """
     if piece_count <= 12:
         bonus = 3
     elif piece_count <= 16:
@@ -38,10 +43,7 @@ def endgame_search_budget(piece_count: int, max_depth: int, time_limit: float):
     else:
         return max_depth, time_limit
     new_depth = min(_ENDGAME_DEPTH_CAP, max_depth + bonus)
-    gained = new_depth - max_depth
-    if gained <= 0:
-        return max_depth, time_limit
-    new_time = min(_ENDGAME_TIME_CAP, time_limit * (2.0 ** gained))
+    new_time = min(_ENDGAME_TIME_CAP, time_limit * (2.0 ** bonus))
     return new_depth, new_time
 
 
@@ -340,6 +342,14 @@ def decide_position(
         if len(alternatives) >= top_n:
             break
 
+    verdict = build_verdict(
+        board,
+        best,
+        score_cp=outcome.score,
+        side_to_move=to_move,
+        our_side=our_side,
+        from_book=from_book,
+    )
     base.update({
         "best_move": best,
         "alternatives": alternatives,
@@ -352,6 +362,7 @@ def decide_position(
             "mate_in": outcome.mate_in,
             "book": from_book,
         },
+        "verdict": verdict,
         "message": best["reason"],
     })
     return base

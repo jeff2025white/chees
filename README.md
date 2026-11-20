@@ -23,7 +23,7 @@
 ## 运行
 
 ```bash
-python ui/app.py          # 截图分析（1024×768）
+python ui/app.py          # 截图分析（1064×768）
 python ui/play.py         # 人机对弈
 python test/batch_run.py  # 批量处理 images/，输出到 images/annotated/
 python -m engine          # 引擎命令行
@@ -92,8 +92,8 @@ python test/bench_native.py --depth 4
 | `engine/piece_model.py` | 兵种 TinyCNN（Torch）加载/批量推理 | 权重 `engine/models/piece_cls.pt` |
 | `engine/piece_ocr.py` | 兵种分配：CNN 优先，模板回退；配额/校验修补 | 超配额清空为 `.`，禁止改判其它兵种 |
 | `engine/fx_overlay.py` | 中部特效脏帧检测 | 自动监听跳过；`test/detect_fx_overlay.py` |
-| `ui/app.py` | 截图分析 / 自动监听 | 默认深度 7；`time_limit≈2.5·3^(d-4)`；监听仅 Windows |
-| `ui/play.py` | 人机对弈界面 | 默认深度 7；更短预算；`fill_pv=False` |
+| `ui/app.py` | 截图分析 / 自动监听 | 默认深度 8；`time_limit≈2.5·3^(d-4)`；监听仅 Windows |
+| `ui/play.py` | 人机对弈界面 | 默认深度 8；更短预算；`fill_pv=False` |
 | `test/test_xiangqi_engine.py` | 引擎回归 | 改引擎后必跑 |
 | `test/test_piece_ocr.py` | 兵种 CNN / 开局 GT | 改识别或重训后必跑 |
 | `test/test_ui_smoke.py` | 分析界面冒烟 | 改 UI 后建议跑 |
@@ -160,13 +160,13 @@ vis = annotate(analysis, d)   # 新图，不改原图
 
 ## 时间预算（界面）
 
-| 界面 | 公式（封顶） | 默认深度 7 约 | 深度 6 约 |
+| 界面 | 公式（封顶） | 默认深度 8 约 | 深度 7 约 |
 |---|---|---|---|
-| 截图分析 | `min(90, max(4, 2.5·3^(d-4)))` | 67.5s | 22.5s |
-| 人机对弈 | `min(30, max(2.5, 1.2·2.5^(d-4)))` | ~18.75s | ~7.5s |
+| 截图分析 | `min(90, max(4, 2.5·3^(d-4)))` | 90s（封顶） | 67.5s |
+| 人机对弈 | `min(30, max(2.5, 1.2·2.5^(d-4)))` | 30s（封顶） | ~18.75s |
 
 引擎按「上一层 ×3」预估是否继续加深；界面显示的是实际达到深度。native 下默认档通常远早于预算返回。
-`decide_position` 在 `piece_count≤20` 时会再自动加深度（≤20/+1，≤16/+2，≤12/+3，封顶 12 层），时间按 `2^加成` 放大（封顶 90s）。
+`decide_position` 在 `piece_count≤20` 时会在**手动深度之上**再加层（≤20/+1，≤16/+2，≤12/+3，封顶 15），时间按 `2^加成` 放大（封顶 90s）。
 
 ## 标注样式
 
@@ -184,9 +184,9 @@ vis = annotate(analysis, d)   # 新图，不改原图
 |---|---|
 | 识别占用 / 网格 | `recognize.py`：`_BOARD_*` 固定布局；`detect_pieces` → `occupy_from_pieces` → `enrich_occupancy_cell_masks` |
 | 兵种推断 | `infer_pieces()` + `piece_ocr`（**Torch CNN 优先**，回退模板）；`tools/export_piece_dataset.py` + `tools/train_piece_classifier.py` → `engine/models/piece_cls.pt` |
-| 棋力 | `evaluate.py` PST（兵过九宫后递减）；`decide.py` 残局加深；`search.py` / `book.py` |
+| 棋力 | `evaluate.py` PST + 开局出子（快出车等）；`decide.py` 残局加深；`search.py` / `book.py`；阶段说明见 `docs/phase-strategy.md` |
 | 分析 UI | `ui/app.py` |
-| 对弈 UI / 难度 | `ui/play.py`（默认深度 7） |
+| 对弈 UI / 难度 | `ui/play.py`（默认深度 8） |
 | 对弈响应速度 | `ui/play.py` 的 `time_limit` 公式 |
 
 ## 测试
