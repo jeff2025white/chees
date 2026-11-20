@@ -124,6 +124,12 @@ cdef void order_moves(Searcher* s, int* frms, int* tos, int n, int ply,
                         sc -= 60000
                     else:
                         sc -= 40000
+                # 开局打兵降权（兵线不在底三行）
+                if (victim & 7) == PAWN:
+                    if attacker_ptype == CANNON:
+                        sc -= 55000
+                    else:
+                        sc -= 35000
         elif ply < MAX_PLY and frms[i] == s.killers_frm[ply][0] and tos[i] == s.killers_to[ply][0]:
             sc = 90000
         elif ply < MAX_PLY and frms[i] == s.killers_frm[ply][1] and tos[i] == s.killers_to[ply][1]:

@@ -49,6 +49,9 @@ cdef int evaluate_board(CBoard* b) noexcept nogil:
         else:
             file_blockers[c] += 1
 
+        if opening:
+            score += DEEP_ARR[p * SQUARES + sq]
+
         if p < 8:
             if ptype == ADVISOR and r >= 7:
                 red_a += 1
@@ -57,10 +60,13 @@ cdef int evaluate_board(CBoard* b) noexcept nogil:
             if opening:
                 if ptype == HORSE and sq != 82 and sq != 88:
                     devel += 18
-                elif ptype == CANNON and c == 4:
-                    devel += 24
-                elif ptype == CANNON and (c == 2 or c == 6):
-                    devel += 8
+                elif ptype == CANNON:
+                    if r <= 3:
+                        devel -= 80
+                    elif c == 4:
+                        devel += 24
+                    elif c == 2 or c == 6:
+                        devel += 8
                 elif ptype == PAWN and r == 5 and (c == 0 or c == 2 or c == 4 or c == 6 or c == 8):
                     devel += 10
                 elif ptype == CHARIOT and r < 9:
@@ -73,10 +79,13 @@ cdef int evaluate_board(CBoard* b) noexcept nogil:
             if opening:
                 if ptype == HORSE and sq != 1 and sq != 7:
                     devel -= 18
-                elif ptype == CANNON and c == 4:
-                    devel -= 24
-                elif ptype == CANNON and (c == 2 or c == 6):
-                    devel -= 8
+                elif ptype == CANNON:
+                    if r >= 6:
+                        devel += 80
+                    elif c == 4:
+                        devel -= 24
+                    elif c == 2 or c == 6:
+                        devel -= 8
                 elif ptype == PAWN and r == 4 and (c == 0 or c == 2 or c == 4 or c == 6 or c == 8):
                     devel -= 10
                 elif ptype == CHARIOT and r > 0:
@@ -111,7 +120,16 @@ cdef int evaluate_board(CBoard* b) noexcept nogil:
 cdef inline int see_value(CBoard* b, int frm, int to) noexcept nogil:
     cdef int victim = b.cells[to]
     cdef int attacker
+    cdef int gain
+    cdef bint defended
     if not victim:
         return 0
     attacker = b.cells[frm]
-    return PIECE_VAL[victim & 7] - (PIECE_VAL[attacker & 7] >> 2)
+    gain = PIECE_VAL[victim & 7]
+    board_apply(b, frm, to)
+    # apply 后 turn 为对方；落点可被吃回则扣满攻击子
+    defended = is_attacked(b, to, b.turn, False)
+    board_undo(b)
+    if defended:
+        return gain - PIECE_VAL[attacker & 7]
+    return gain

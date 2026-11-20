@@ -223,6 +223,7 @@ class ChessApp:
         self._auto_stop = threading.Event()
         self._computing = threading.Event()     # 计算中 → 暂停截图
         self._last_grid_str = None               # 上一帧棋盘串（帧差）
+        self._auto_skip_reason = None            # 等待态日志去重
         self._target_hwnd = None                 # 找到的手游助手窗口句柄
 
         self._build_ui()
@@ -472,6 +473,7 @@ class ChessApp:
         self._auto_running = True
         self._auto_stop.clear()
         self._last_grid_str = None
+        self._auto_skip_reason = None  # 等待态去重：仅状态变化时打一行
         self._computing.clear()
         # UI 切换
         self.btn_shot.configure(text="停止监听", activebackground="#ff6b6b")
@@ -545,8 +547,11 @@ class ChessApp:
                 continue
             if fx.get("dirty"):
                 level = fx.get("level", "?")
-                self.root.after(0, lambda lv=level: self._auto_status(
-                    f"[{time.strftime('%H:%M:%S')}] 特效遮挡（{lv}），跳过"))
+                reason = f"fx:{level}"
+                if reason != self._auto_skip_reason:
+                    self._auto_skip_reason = reason
+                    self.root.after(0, lambda lv=level: self._auto_status(
+                        f"[{time.strftime('%H:%M:%S')}] 特效中（{lv}）"))
                 time.sleep(1.0)
                 continue
 
@@ -567,11 +572,15 @@ class ChessApp:
 
             if not has_board:
                 # 无棋盘（首页/结算页等）→ 不触发计算，继续等下一帧
-                self.root.after(0, lambda: self._auto_status(
-                    f"[{time.strftime('%H:%M:%S')}] 无棋盘（红{r_cnt}/黑{b_cnt}），跳过"))
+                if self._auto_skip_reason != "no_board":
+                    self._auto_skip_reason = "no_board"
+                    self.root.after(0, lambda: self._auto_status(
+                        f"[{time.strftime('%H:%M:%S')}] 无棋盘"))
                 self._last_grid_str = None
                 time.sleep(1.0)
                 continue
+
+            self._auto_skip_reason = None
 
             # 跟上次棋盘比
             changed = (self._last_grid_str is not None) and (grid_str != self._last_grid_str)
@@ -583,13 +592,11 @@ class ChessApp:
 
             if first_time:
                 self.root.after(0, lambda: self._auto_status(
-                    f"[{time.strftime('%H:%M:%S')}] 有棋盘 红{r_cnt}/黑{b_cnt}，首次触发计算"))
+                    f"[{time.strftime('%H:%M:%S')}] 红{r_cnt}/黑{b_cnt} · 开始分析"))
             elif changed:
                 self.root.after(0, lambda: self._auto_status(
-                    f"[{time.strftime('%H:%M:%S')}] 有棋盘 红{r_cnt}/黑{b_cnt}，局面变化 → 触发计算"))
-            else:
-                self.root.after(0, lambda: self._auto_status(
-                    f"[{time.strftime('%H:%M:%S')}] 有棋盘 红{r_cnt}/黑{b_cnt}，局面未变"))
+                    f"[{time.strftime('%H:%M:%S')}] 红{r_cnt}/黑{b_cnt} · 局面变化"))
+            # 局面未变：静默等待，不刷日志
 
             # 首次 or 变化 → 清空旧日志 + 触发计算；算完自动覆盖为标注图
             if first_time or changed:
@@ -887,6 +894,8 @@ class ChessApp:
                 block.append(("", f"\n评价 {best['score_text']}"
                                   f"{' · 将' if best.get('gives_check') else ''}"
                                   f"{' · 杀' if best.get('is_mate') else ''}\n"))
+                if best.get("reason"):
+                    block.append(("", f"{best['reason']}\n"))
                 src = "开局库+" if search_info.get("book") else ""
                 block.append(("", f"{src}深度{search_info.get('depth', 0)}"
                                   f" · {search_info.get('nodes', 0):,}节点"

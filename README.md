@@ -101,6 +101,14 @@ python test/bench_native.py --depth 4
 
 `test/` 下 `diag_*` / `recognize_v*` 等为调试遗留，可忽略。
 
+## 文档
+
+| 文档 | 内容 |
+|------|------|
+| [docs/phase-strategy.md](docs/phase-strategy.md) | **开局 / 中局 / 残局**策略调整（库、评估、排序、加深） |
+| [docs/decision-logic.md](docs/decision-logic.md) | 决策与搜索全链路 |
+| [docs/recognize-logic.md](docs/recognize-logic.md) | 截图识别与标注 |
+
 ## 防回退契约（曾反复出错）
 
 完整条文见 `.cursor/rules/xiangqi-side-pv-annotate.mdc`。

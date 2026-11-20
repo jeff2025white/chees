@@ -1,10 +1,11 @@
-"""局面评估：子力价值 + 位置分（分兵种位置表）+ 开局阶段深入惩罚。
+"""局面评估：子力价值 + 位置分（分兵种位置表）+ 开局深入惩罚。
 
 评分以红方视角计算（正数表示红方占优），搜索中按行棋方取正负。
 单位：厘兵（1 兵 = 100）。
 
-evaluate() 单次扫盘融合子力/PST/深入/出子/将帅安全，再单独扫列算控线，
-避免原先多次全盘遍历。Board.base_score 维护子力+PST+深入的增量值。
+evaluate() 单次扫盘融合子力/PST/出子/将帅安全/控线；
+开局时额外叠加深入惩罚（残局不扣，避免压制攻将）。
+Board.base_score 只维护子力+PST 增量。
 """
 
 from .constants import (
@@ -161,17 +162,17 @@ _init_deep_table()
 
 
 def piece_base_term(piece: int, sq: int) -> int:
-    """子力 + PST + 深入惩罚（红方视角）。空子返回 0。"""
+    """子力 + PST（红方视角）。空子返回 0。深入惩罚不在此计入。"""
     if not piece:
         return 0
     ptype = piece & 7
     if piece < 8:
-        return PIECE_VALUE[ptype] + PST_FLAT[ptype][sq] + _DEEP[piece * SQUARES + sq]
-    return -(PIECE_VALUE[ptype] + PST_FLAT[ptype][MIRROR[sq]]) + _DEEP[piece * SQUARES + sq]
+        return PIECE_VALUE[ptype] + PST_FLAT[ptype][sq]
+    return -(PIECE_VALUE[ptype] + PST_FLAT[ptype][MIRROR[sq]])
 
 
 def compute_base_score(cells) -> int:
-    """全量重算子力+PST+深入（供 Board 初始化 / 校验）。"""
+    """全量重算子力+PST（供 Board 初始化 / 校验）。"""
     score = 0
     for sq, piece in enumerate(cells):
         if piece:
@@ -212,8 +213,8 @@ def _file_control_from_cols(file_red, file_black, file_blockers) -> int:
 def evaluate(board) -> int:
     """返回红方视角的静态评分（厘兵）。
 
-    优先使用 Board.base_score（子力+PST+深入增量），单次扫盘补算出子/将帅，
-    再扫列算控线。
+    优先使用 Board.base_score（子力+PST 增量），单次扫盘补算出子/将帅/控线；
+    仅开局叠加深入惩罚。
     """
     cells = board.cells
     base = getattr(board, "base_score", None)
@@ -249,6 +250,10 @@ def evaluate(board) -> int:
         ptype = p & 7
         r, c = divmod(sq, COLS)
 
+        if opening:
+            # 开局才扣深入；残局不惩罚大子攻入底线
+            score += _DEEP[p * SQUARES + sq]
+
         if ptype in (CHARIOT, CANNON):
             if p < 8:
                 file_red[c].append(ptype)
@@ -265,10 +270,14 @@ def evaluate(board) -> int:
             if opening:
                 if ptype == HORSE and sq not in (82, 88):
                     devel += 18
-                elif ptype == CANNON and c == 4:
-                    devel += 24
-                elif ptype == CANNON and c in (2, 6):
-                    devel += 8
+                elif ptype == CANNON:
+                    # 炮入对方兵线：抑制开局贪打兵；中炮加分仅计己方半场
+                    if r <= 3:
+                        devel -= 80
+                    elif c == 4:
+                        devel += 24
+                    elif c in (2, 6):
+                        devel += 8
                 elif ptype == PAWN and r == 5 and c in (0, 2, 4, 6, 8):
                     devel += 10
                 elif ptype == CHARIOT and r < 9:
@@ -281,10 +290,13 @@ def evaluate(board) -> int:
             if opening:
                 if ptype == HORSE and sq not in (1, 7):
                     devel -= 18
-                elif ptype == CANNON and c == 4:
-                    devel -= 24
-                elif ptype == CANNON and c in (2, 6):
-                    devel -= 8
+                elif ptype == CANNON:
+                    if r >= 6:
+                        devel += 80
+                    elif c == 4:
+                        devel -= 24
+                    elif c in (2, 6):
+                        devel -= 8
                 elif ptype == PAWN and r == 4 and c in (0, 2, 4, 6, 8):
                     devel -= 10
                 elif ptype == CHARIOT and r > 0:
@@ -312,18 +324,25 @@ def evaluate_for(board, color: int) -> int:
 
 
 def see_value(board, move) -> int:
-    """静态交换近似：吃子收益 − 己方最小被吃回代价（一层）。
+    """一层静态交换：吃子收益；若落点可被对方吃回则扣满攻击子价值。
 
-    用于吃子排序与静态搜索差值剪枝；不追求完美 SEE 树。
+    用于吃子排序；不展开完整 SEE 树。
     """
+    from .movegen import is_attacked
+
     frm, to = move
     cells = board.cells
     victim = cells[to]
     if not victim:
         return 0
-    gain = PIECE_VALUE[victim & 7]
-    # 粗估：落点被对方攻击时，减去攻击方最小子力（用己方棋子价值近似）
     attacker = cells[frm]
-    # 走后己方子停在 to，若对方能吃回，至少亏掉 attacker 价值的一部分
-    # 这里用简单启发：gain - attacker/4，避免无根瞎吃
-    return gain - (PIECE_VALUE[attacker & 7] >> 2)
+    gain = PIECE_VALUE[victim & 7]
+    board.apply(move)
+    try:
+        # apply 后轮到对方；若对方能吃回落点子，按整子兑掉计
+        defended = is_attacked(board, to, board.turn, king_face=False)
+    finally:
+        board.undo()
+    if defended:
+        return gain - PIECE_VALUE[attacker & 7]
+    return gain

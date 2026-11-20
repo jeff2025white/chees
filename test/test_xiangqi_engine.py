@@ -13,10 +13,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import decide_position
 from engine.board import Board
-from engine.constants import BLACK, RED, START_FEN
+from engine.book import book_entries, book_lines, iccs_to_move, lookup_book
+from engine.constants import BLACK, CHARIOT, HORSE, PIECE_VALUE, RED, START_FEN
 from engine.decide import parse_side
-from engine.movegen import game_status, generate_legal_moves, perft
-from engine.notation import chinese_notation
+from engine.evaluate import evaluate, see_value
+from engine.movegen import game_status, generate_legal, generate_legal_moves, perft
+from engine.notation import chinese_notation, move_to_iccs
+from engine.search import search
 
 MATE_IN_ONE_FEN = "3ak4/8R/5a3/3N5/9/9/9/9/9/3K5 w - - 0 1"
 STALEMATE_FEN = "4k4/3N5/2N6/3N5/9/9/9/9/9/3K5 b - - 0 1"
@@ -125,7 +128,7 @@ class TestDecisionAPI(unittest.TestCase):
 
     def test_grid_bottom_side_moves_first(self):
         board = Board.from_fen(START_FEN)
-        # 黑方在下：第一步固定为我方（黑）先走 + 开局库
+        # 黑方在下：第一步固定为我方（黑）先走 + 开局库（镜像中炮）
         flipped = "\n".join("".join(reversed(line))
                             for line in reversed(board.to_grid().splitlines()))
         result = decide_position(grid=flipped, side=None, view_side="black",
@@ -134,7 +137,7 @@ class TestDecisionAPI(unittest.TestCase):
         self.assertEqual(result["input"]["our_side"], "black")
         self.assertEqual(result["input"]["view_side"], "black")
         self.assertTrue(result["search"]["book"])
-        self.assertEqual(result["best_move"]["iccs"], "h10g8")
+        self.assertEqual(result["best_move"]["iccs"], "h8e8")
         self.assertEqual(result["best_move"]["color"], "black")
         # PV 第一步必须是我方
         self.assertEqual(result["pv"]["sides"][0], "black")
@@ -199,6 +202,128 @@ class TestDecisionAPI(unittest.TestCase):
         self.assertEqual(mirrored["input"]["fen"], base["input"]["fen"])
         self.assertEqual(mirrored["best_move"]["from"], {"col": 0, "row": 8})
         self.assertEqual(mirrored["best_move"]["iccs"], base["best_move"]["iccs"])
+
+
+class TestOpeningBook(unittest.TestCase):
+    def test_principal_lines_stay_in_book(self):
+        """沿 3 条主线逐步走子：每步着法都在库中；权重最高主线逐步等于 lookup。"""
+        lines = book_lines()
+        top_weight = max(w for _n, _s, w in lines)
+        for name, seq, weight in lines:
+            board = Board.from_fen(START_FEN)
+            for ply, iccs in enumerate(seq):
+                entries = book_entries(board)
+                self.assertTrue(entries, f"{name} ply={ply} 应在开局库")
+                entry_iccs = {e[2] for e in entries}
+                self.assertIn(iccs, entry_iccs, f"{name} ply={ply}")
+                if weight == top_weight:
+                    hit = lookup_book(board)
+                    self.assertEqual(hit[2], iccs, f"{name} ply={ply} 主线应优先")
+                    result = decide_position(fen=board.to_fen(), time_limit=0.05,
+                                             max_depth=1, fill_pv=False)
+                    self.assertTrue(result["search"]["book"], f"{name} ply={ply}")
+                    self.assertEqual(result["best_move"]["iccs"], iccs)
+                board.apply(iccs_to_move(iccs))
+
+    def test_deviation_leaves_book(self):
+        """故意偏一手后应脱谱。"""
+        board = Board.from_fen(START_FEN)
+        board.apply(iccs_to_move("h3e3"))  # 炮二平五
+        board.apply(iccs_to_move("a10a9"))  # 偏着：车1进1（非主变）
+        self.assertIsNone(lookup_book(board))
+        result = decide_position(fen=board.to_fen(), time_limit=0.2,
+                                 max_depth=2, fill_pv=False)
+        self.assertFalse(result["search"]["book"])
+
+    def test_start_alternatives_include_left_cannon(self):
+        board = Board.from_fen(START_FEN)
+        result = decide_position(fen=board.to_fen(), time_limit=0.05,
+                                 max_depth=1, top_n=3, fill_pv=False)
+        self.assertTrue(result["search"]["book"])
+        self.assertEqual(result["best_move"]["iccs"], "h3e3")
+        alt_iccs = {a["iccs"] for a in result["alternatives"]}
+        self.assertIn("b3e3", alt_iccs)
+
+
+class TestOpeningAntiPawnGrab(unittest.TestCase):
+    def test_early_cannon_raid_eval_not_rewarded(self):
+        """开局炮打中兵后的静态分不应明显高于出车发展。"""
+        from engine.book import iccs_to_move
+        base = Board.from_fen(START_FEN)
+        for iccs in ("h3e3", "h10g8", "h1g3", "b10c8"):
+            base.apply(iccs_to_move(iccs))
+        self.assertTrue(base.is_opening())
+
+        develop = base.clone()
+        develop.apply(iccs_to_move("i1h1"))  # 车一平二
+        raid = base.clone()
+        raid.apply(iccs_to_move("e3e7"))  # 炮五进四打中卒
+
+        # 贪打兵不应凭子力领先一截
+        self.assertLessEqual(evaluate(raid) - evaluate(develop), 40)
+
+    def test_search_prefers_develop_over_cannon_pawn_grab(self):
+        """开局搜索（绕过书）不应首选炮打中卒。"""
+        from engine.book import iccs_to_move
+        board = Board.from_fen(START_FEN)
+        for iccs in ("h3e3", "h10g8", "h1g3", "b10c8"):
+            board.apply(iccs_to_move(iccs))
+        outcome = search(board, time_limit=1.5, max_depth=5, top_n=0, fill_pv=False)
+        self.assertIsNotNone(outcome.best_move)
+        self.assertNotEqual(move_to_iccs(outcome.best_move), "e3e7")
+
+
+class TestSeeAndDeep(unittest.TestCase):
+    def test_see_rook_takes_defended_horse_is_negative(self):
+        """车吃被马护的马：SEE 应为 马价值−车价值。"""
+        # e8 马由 g7 马保护；车在 e2 可吃
+        fen = "4k4/9/4n4/6n2/9/9/9/9/4R4/4K4 w - - 0 1"
+        board = Board.from_fen(fen)
+        move = None
+        for mv in generate_legal(board):
+            if ((board.cells[mv[0]] & 7) == CHARIOT
+                    and board.cells[mv[1]]
+                    and (board.cells[mv[1]] & 7) == HORSE):
+                move = mv
+                break
+        self.assertIsNotNone(move)
+        self.assertEqual(
+            see_value(board, move),
+            PIECE_VALUE[HORSE] - PIECE_VALUE[CHARIOT],
+        )
+
+    def test_see_rook_takes_undefended_horse_is_gain(self):
+        """车吃无根马：SEE 应为整只马价值。"""
+        fen = "4k4/9/4n4/9/9/9/9/9/4R4/4K4 w - - 0 1"
+        board = Board.from_fen(fen)
+        move = None
+        for mv in generate_legal(board):
+            if ((board.cells[mv[0]] & 7) == CHARIOT
+                    and board.cells[mv[1]]
+                    and (board.cells[mv[1]] & 7) == HORSE):
+                move = mv
+                break
+        self.assertIsNotNone(move)
+        self.assertEqual(see_value(board, move), PIECE_VALUE[HORSE])
+
+    def test_endgame_deep_rook_not_heavily_penalized(self):
+        """残局双车深入不应比底线双车低约 2×180。"""
+        safe = Board.from_fen("4k4/9/5n3/9/9/9/9/9/9/R3K3R w - - 0 1")
+        deep = Board.from_fen("4k4/R7R/5n3/9/9/9/9/9/9/4K4 w - - 0 1")
+        self.assertFalse(safe.is_opening())
+        self.assertFalse(deep.is_opening())
+        # 深入仅 PST 差，不应再各扣 180
+        self.assertGreater(evaluate(deep), evaluate(safe) - 200)
+
+    def test_avoid_rook_for_defended_horse_when_ahead(self):
+        """大优时不应首选车换被保护的马。"""
+        fen = "3aka3/9/4n4/6n2/9/9/9/9/4R4/3AKA3 w - - 0 1"
+        board = Board.from_fen(fen)
+        result = decide_position(fen=board.to_fen(), time_limit=2.0,
+                                 max_depth=6, top_n=0, fill_pv=False)
+        best = result["best_move"]
+        self.assertIsNotNone(best)
+        self.assertNotEqual(best.get("captured"), "马")
 
 
 if __name__ == "__main__":

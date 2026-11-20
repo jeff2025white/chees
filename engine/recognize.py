@@ -1028,16 +1028,8 @@ def annotate(analysis, decision, draw_grid=True):
         cv2.line(vis, (cx, cy), (cx + dx * corner, cy), (255, 220, 0), thick)
         cv2.line(vis, (cx, cy), (cx, cy + dy * corner), (255, 220, 0), thick)
 
-    if draw_grid:
-        for r in range(ROWS + 1):
-            y = int(round(y0 + a.row0 - cell / 2 + r * cell))
-            cv2.line(vis, (board_l, y), (board_r, y), (90, 90, 90), 1)
-        for c in range(COLS + 1):
-            x = int(round(x0 + a.col0 - cell / 2 + c * cell))
-            cv2.line(vis, (x, board_t), (x, board_b), (90, 90, 90), 1)
-        # 楚河汉界（row4 / row5 之间）加一条稍亮的中线，便于核对行对齐
-        river_y = int(round(y0 + a.row0 + 4.5 * cell))
-        cv2.line(vis, (board_l, river_y), (board_r, river_y), (0, 180, 255), 2)
+    # 只保留外包线（青色框+角标）；不再画格线 / 楚河中线
+    # draw_grid 保留参数兼容旧调用，当前一律不画网格
 
     best = decision.get("best_move") if decision else None
     if best:
@@ -1074,24 +1066,5 @@ def annotate(analysis, decision, draw_grid=True):
         cv2.circle(vis, (fx, fy), rad + 7, (0, 0, 255), 5)
         cv2.circle(vis, (fx, fy), rad + 1, (255, 255, 255), 2)
         cv2.circle(vis, (tx, ty), rad + 5, (255, 0, 0), 5)
-
-        label = f"{best['chinese']} ({best['iccs']})  {best['score_text']}"
-        if len(pv.get("chinese") or []) >= 2:
-            label = f"{pv['chinese'][0]} / {pv['chinese'][1]}  {best['score_text']}"
-        reason = best.get("reason", "")
-        if reason:
-            reason = reason[:70]
-
-        # 字号随图片宽度自适应，文字衬半透明底以提升可读性
-        fs = 0.9 * min(1.6, max(0.85, vis.shape[1] / 720.0))
-        width, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, 2)[0]
-        roof = 12 + int(38 * fs)
-        overlay = vis.copy()
-        cv2.rectangle(overlay, (0, 0), (width + 24, roof), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.55, vis, 0.45, 0, vis)
-        cv2.putText(vis, label, (12, int(30 * fs)), cv2.FONT_HERSHEY_SIMPLEX, fs,
-                    (0, 0, 255), 2, cv2.LINE_AA)
-        if reason:
-            cv2.putText(vis, reason, (12, int(30 * fs) + baseline + int(14 * fs)),
-                        cv2.FONT_HERSHEY_SIMPLEX, fs * 0.62, (255, 200, 120), 1, cv2.LINE_AA)
+        # 着法/评价文字只写右侧日志，不叠在截图左上角
     return vis

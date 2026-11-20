@@ -50,7 +50,7 @@ class Board:
     cells 为长度 90 的一维数组；turn 表示轮到哪一方走（RED / BLACK）。
     undo_stack 保存 (move, captured, hash_before) 供撤销；
     hash_stack 保存每一步之后的 Zobrist 哈希，用于重复局面判断。
-    piece_count / base_score 随走子增量维护，供评估加速。
+    piece_count / base_score（子力+PST）随走子增量维护，供评估加速。
     """
 
     __slots__ = ("cells", "turn", "undo_stack", "hash_stack", "kings",

@@ -8,7 +8,7 @@
 
 import time
 
-from .constants import BLACK, CANNON, CHARIOT, HORSE, PIECE_VALUE, RED
+from .constants import BLACK, CANNON, CHARIOT, HORSE, PAWN, PIECE_VALUE, RED
 from .evaluate import evaluate, see_value
 from .movegen import generate_captures, generate_legal, in_check
 
@@ -139,18 +139,23 @@ class Searcher:
                 s = 10 ** 7
             elif victim:
                 attacker_ptype = cells[mv[0]] & 7
+                victim_ptype = victim & 7
                 # MVV-LVA；SEE 只作微调，避免打乱原有吃子优先级
                 s = (100000
-                     + PIECE_VALUE[victim & 7] * 10
+                     + PIECE_VALUE[victim_ptype] * 10
                      - PIECE_VALUE[attacker_ptype]
                      + (see_value(board, mv) >> 2))
-                if (is_open
-                        and attacker_ptype in (CANNON, HORSE, CHARIOT)
-                        and (mv[1] // 9) in opp_rows):
-                    if attacker_ptype == CANNON:
-                        s -= 60000
-                    else:
-                        s -= 40000
+                if is_open and attacker_ptype in (CANNON, HORSE, CHARIOT):
+                    to_row = mv[1] // 9
+                    # 深入对方底三行吃子降权
+                    if to_row in opp_rows:
+                        s -= 60000 if attacker_ptype == CANNON else 40000
+                    # 开局打兵：兵不在底三行，单独降权，避免炮/马贪吃打乱布局
+                    if victim_ptype == PAWN:
+                        if attacker_ptype == CANNON:
+                            s -= 55000
+                        else:
+                            s -= 35000
             elif mv == killers[0]:
                 s = 90000
             elif mv == killers[1]:

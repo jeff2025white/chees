@@ -43,9 +43,10 @@ cdef inline int piece_base_term(int piece, int sq) noexcept nogil:
     if piece == 0:
         return 0
     ptype = piece & 7
+    # 子力+PST；深入惩罚仅在 evaluate_board 开局时叠加
     if piece < 8:
-        return PIECE_VAL[ptype] + PST_FLAT_ARR[ptype][sq] + DEEP_ARR[piece * SQUARES + sq]
-    return -(PIECE_VAL[ptype] + PST_FLAT_ARR[ptype][MIRROR_ARR[sq]]) + DEEP_ARR[piece * SQUARES + sq]
+        return PIECE_VAL[ptype] + PST_FLAT_ARR[ptype][sq]
+    return -(PIECE_VAL[ptype] + PST_FLAT_ARR[ptype][MIRROR_ARR[sq]])
 
 
 cdef inline void board_init_from_cells(CBoard* b, int* cells, int turn) noexcept nogil:
