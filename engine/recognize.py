@@ -990,8 +990,12 @@ def _draw_piece_labels(vis, analysis, half):
     return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
 
-def annotate(analysis, decision, draw_grid=True):
-    """把网格、棋子圈与最佳着法画到原图上，返回新图（BGR）。"""
+def annotate(analysis, decision, draw_grid=True, draw_labels=True):
+    """把网格、棋子圈与最佳着法画到原图上，返回新图（BGR）。
+
+    draw_labels: 是否在棋子格角画识别出的兵种中文（可由界面开关控制）。
+    draw_grid: 保留兼容；当前不画格线。
+    """
     a = analysis
     vis = a.image.copy()
     x0, y0, x1, y1 = a.crop_box
@@ -999,7 +1003,8 @@ def annotate(analysis, decision, draw_grid=True):
     half = int(cell * 0.46)
 
     # --- 兵种文字：格角标注，字色与棋子红/黑一致（不再画外包黑框）---
-    vis = _draw_piece_labels(vis, a, half)
+    if draw_labels:
+        vis = _draw_piece_labels(vis, a, half)
 
     # --- 合法性校验：非法棋子画红X ---
     for (r, c), _violations in a.violations.items():
@@ -1035,7 +1040,7 @@ def annotate(analysis, decision, draw_grid=True):
     if best:
         pv = decision.get("pv") or {}
         pv_steps = pv.get("steps") or []
-        # 契约：推演第 1 手=我方、第 2 手=对方应手；两手都画在棋盘上
+        # 契约：第 1 手=我方、第 2 手=对方；第 3 手=我方续着（半透明）
         rad = int(cell * 0.45)
         half = int(cell * 0.46)
 
@@ -1044,7 +1049,26 @@ def annotate(analysis, decision, draw_grid=True):
             tx, ty = a.cell_center(step["to"]["row"], step["to"]["col"])
             return int(fx), int(fy), int(tx), int(ty)
 
-        # 先画第 2 手（对方）：绿线 + 绿框起点 + 黄框终点
+        def _draw_our_move(img, step, *, start_bgr, end_bgr, line_w=3, circle_w=5):
+            """我方着法：色线 + 色圈起点 + 白内圈 + 色圈终点。"""
+            fx, fy, tx, ty = _step_coords(step)
+            cv2.line(img, (fx, fy), (tx, ty), start_bgr, line_w)
+            cv2.circle(img, (fx, fy), rad + 7, start_bgr, circle_w)
+            cv2.circle(img, (fx, fy), rad + 1, (255, 255, 255), 2)
+            cv2.circle(img, (tx, ty), rad + 5, end_bgr, circle_w)
+
+        # 第 1 手：红 / 蓝；第 3 手：相近的橙红 / 青蓝，便于区分
+        OUR1_START, OUR1_END = (0, 0, 255), (255, 0, 0)
+        OUR3_START, OUR3_END = (0, 110, 255), (255, 170, 40)
+
+        # 先画第 3 手（我方续着）：相近色，垫在下层
+        if len(pv_steps) >= 3:
+            _draw_our_move(
+                vis, pv_steps[2],
+                start_bgr=OUR3_START, end_bgr=OUR3_END, line_w=3, circle_w=4,
+            )
+
+        # 再画第 2 手（对方）：绿线 + 绿框起点 + 黄框终点
         if len(pv_steps) >= 2:
             rfx, rfy, rtx, rty = _step_coords(pv_steps[1])
             cv2.line(vis, (rfx, rfy), (rtx, rty), (0, 200, 0), 3)
@@ -1053,7 +1077,7 @@ def annotate(analysis, decision, draw_grid=True):
             cv2.rectangle(vis, (rtx - half, rty - half), (rtx + half, rty + half),
                           (0, 255, 255), 4)
 
-        # 再画第 1 手（我方）：红线 + 红圈起点 + 蓝圈终点（盖在上层）
+        # 最后画第 1 手（我方）：红蓝，盖在上层
         if pv_steps:
             our = pv_steps[0]
         else:
@@ -1061,10 +1085,6 @@ def annotate(analysis, decision, draw_grid=True):
                 "from": {"row": best["from"]["row"], "col": best["from"]["col"]},
                 "to": {"row": best["to"]["row"], "col": best["to"]["col"]},
             }
-        fx, fy, tx, ty = _step_coords(our)
-        cv2.line(vis, (fx, fy), (tx, ty), (0, 0, 255), 3)
-        cv2.circle(vis, (fx, fy), rad + 7, (0, 0, 255), 5)
-        cv2.circle(vis, (fx, fy), rad + 1, (255, 255, 255), 2)
-        cv2.circle(vis, (tx, ty), rad + 5, (255, 0, 0), 5)
-        # 着法/评价文字只写右侧日志，不叠在截图左上角
+        _draw_our_move(vis, our, start_bgr=OUR1_START, end_bgr=OUR1_END)
+        # 着法/评价文字只写右侧评价面板，不叠在截图左上角
     return vis

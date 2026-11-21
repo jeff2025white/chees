@@ -56,3 +56,16 @@ def get_depth(default: int = _DEFAULT_DEPTH) -> int:
 def set_depth(depth: int) -> None:
     """保存迭代深度（分析页 / 对弈页共用）。"""
     save_prefs(depth=_clamp_depth(depth))
+
+
+def get_show_piece_labels(default: bool = True) -> bool:
+    """棋子上是否显示识别兵种文字。"""
+    data = load_prefs()
+    if "show_piece_labels" in data:
+        return bool(data["show_piece_labels"])
+    return bool(default)
+
+
+def set_show_piece_labels(on: bool) -> None:
+    """保存兵种文字开关。"""
+    save_prefs(show_piece_labels=bool(on))

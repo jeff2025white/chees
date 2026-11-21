@@ -345,6 +345,30 @@ cdef int root_search(Searcher* s, int depth, int alpha, int beta,
     return 1
 
 
+cdef inline bint pv_causes_repetition(CBoard* b, int move_frm, int move_to) noexcept nogil:
+    """允许单次进退；禁止走成已出现过的局面（连续循环）。"""
+    cdef bint rep
+    board_apply(b, move_frm, move_to)
+    rep = board_is_repetition(b)
+    board_undo(b)
+    return rep
+
+
+cdef inline bint pv_move_ok(CBoard* b, int move_frm, int move_to) noexcept nogil:
+    if move_frm < 0:
+        return False
+    return not pv_causes_repetition(b, move_frm, move_to)
+
+
+cdef inline bint pv_is_forbidden(int move_frm, int move_to,
+                                 int* bad_frms, int* bad_tos, int bad_n) noexcept nogil:
+    cdef int i
+    for i in range(bad_n):
+        if bad_frms[i] == move_frm and bad_tos[i] == move_to:
+            return True
+    return False
+
+
 cdef int extract_pv(Searcher* s, int first_frm, int first_to, int max_len, bint fill,
                     int* pv_frms, int* pv_tos):
     cdef CBoard scratch
@@ -354,6 +378,8 @@ cdef int extract_pv(Searcher* s, int first_frm, int first_to, int max_len, bint 
     cdef int rfrms[MAX_MOVES], rtos[MAX_MOVES], rscores[MAX_MOVES], rexact[MAX_MOVES]
     cdef int e_depth, e_score, e_flag, e_frm, e_to
     cdef CBoard saved
+    cdef int bad_frms[MAX_MOVES], bad_tos[MAX_MOVES], bad_n, attempt
+    cdef int chosen_frm, chosen_to
 
     board_clone(&scratch, &s.board)
     move_frm = first_frm
@@ -367,43 +393,81 @@ cdef int extract_pv(Searcher* s, int first_frm, int first_to, int max_len, bint 
         n = generate_legal(&scratch, scratch.turn, False, False, frms, tos)
         if n == 0:
             break
-        found = 0
-        if move_frm >= 0:
-            for i in range(n):
-                if frms[i] == move_frm and tos[i] == move_to:
-                    found = 1
-                    break
-        if not found:
-            if not fill:
-                break
-            saved = s.board
-            s.board = scratch
-            remain = max_len - ply
-            if remain < 1:
-                remain = 1
-            if remain > 3:
-                remain = 3
-            root_search(s, remain, -INF_SCORE, INF_SCORE,
-                        &bm_frm, &bm_to, &bm_score,
-                        rfrms, rtos, rscores, rexact, &rn)
-            s.board = saved
-            if s.aborted:
-                s.aborted = False
-            move_frm = bm_frm
-            move_to = bm_to
+        bad_n = 0
+        chosen_frm = -1
+        chosen_to = -1
+        for attempt in range(n + 1):
             found = 0
-            if move_frm >= 0:
-                n = generate_legal(&scratch, scratch.turn, False, False, frms, tos)
+            if move_frm >= 0 and not pv_is_forbidden(move_frm, move_to, bad_frms, bad_tos, bad_n):
                 for i in range(n):
                     if frms[i] == move_frm and tos[i] == move_to:
                         found = 1
                         break
             if not found:
-                break
-        pv_frms[pv_len] = move_frm
-        pv_tos[pv_len] = move_to
+                if not fill:
+                    break
+                saved = s.board
+                s.board = scratch
+                remain = max_len - ply
+                if remain < 1:
+                    remain = 1
+                if remain > 3:
+                    remain = 3
+                root_search(s, remain, -INF_SCORE, INF_SCORE,
+                            &bm_frm, &bm_to, &bm_score,
+                            rfrms, rtos, rscores, rexact, &rn)
+                s.board = saved
+                if s.aborted:
+                    s.aborted = False
+                move_frm = bm_frm
+                move_to = bm_to
+                found = 0
+                if (move_frm >= 0
+                        and not pv_is_forbidden(move_frm, move_to, bad_frms, bad_tos, bad_n)
+                        and pv_move_ok(&scratch, move_frm, move_to)):
+                    n = generate_legal(&scratch, scratch.turn, False, False, frms, tos)
+                    for i in range(n):
+                        if frms[i] == move_frm and tos[i] == move_to:
+                            found = 1
+                            break
+                if not found:
+                    # 续搜着会重复局面：按着法排序改选
+                    n = generate_legal(&scratch, scratch.turn, False, False, frms, tos)
+                    saved = s.board
+                    s.board = scratch
+                    order_moves(s, frms, tos, n, 0, -1, -1)
+                    s.board = saved
+                    move_frm = -1
+                    move_to = -1
+                    for i in range(n):
+                        if pv_is_forbidden(frms[i], tos[i], bad_frms, bad_tos, bad_n):
+                            continue
+                        if pv_move_ok(&scratch, frms[i], tos[i]):
+                            move_frm = frms[i]
+                            move_to = tos[i]
+                            found = 1
+                            break
+                if not found:
+                    break
+            if not pv_move_ok(&scratch, move_frm, move_to):
+                if bad_n < MAX_MOVES:
+                    bad_frms[bad_n] = move_frm
+                    bad_tos[bad_n] = move_to
+                    bad_n += 1
+                move_frm = -1
+                move_to = -1
+                if not fill:
+                    break
+                continue
+            chosen_frm = move_frm
+            chosen_to = move_to
+            break
+        if chosen_frm < 0:
+            break
+        pv_frms[pv_len] = chosen_frm
+        pv_tos[pv_len] = chosen_to
         pv_len += 1
-        board_apply(&scratch, move_frm, move_to)
+        board_apply(&scratch, chosen_frm, chosen_to)
         if tt_probe(board_hash(&scratch), &e_depth, &e_score, &e_flag, &e_frm, &e_to):
             move_frm = e_frm
             move_to = e_to

@@ -336,11 +336,51 @@ class Searcher:
         return best_move, best_score, results
 
     # -- 主变提取 ---------------------------------------------------------
+    @staticmethod
+    def _causes_repetition(board, move) -> bool:
+        """走该着后是否立刻形成重复局面（循环着法的搜索侧近似）。
+
+        允许单次进退/调位；禁止把已经出现过的局面再走一遍（连续循环）。
+        """
+        board.apply(move)
+        rep = board.is_repetition()
+        board.undo()
+        return rep
+
+    def _pv_move_ok(self, board, move) -> bool:
+        return move is not None and not self._causes_repetition(board, move)
+
+    def _pick_pv_fill(self, board, remain: int, forbidden: set):
+        """浅层续搜；若着法会重复局面则按排序改选其它着。"""
+        origin = self.board
+        self.board = board
+        bm = None
+        ordered = []
+        try:
+            try:
+                bm, _, _ = self.root_search(max(1, min(remain, 3)))
+            except TimeUp:
+                bm = None
+            legal = generate_legal(board, board.turn)
+            if (bm is not None and bm not in forbidden and bm in legal
+                    and self._pv_move_ok(board, bm)):
+                return bm
+            ordered = self._order_moves(legal, ply=0)
+        finally:
+            self.board = origin
+        for cand in ordered:
+            if cand in forbidden:
+                continue
+            if self._pv_move_ok(board, cand):
+                return cand
+        return None
+
     def extract_pv(self, first_move, max_len: int = 6, fill: bool = True):
         """抽出长度尽量接近 max_len 的主变。
 
         优先跟置换表；fill=True 且表断了则浅层续搜（分析页）；
         fill=False 时只跟 TT（对弈页）。
+        允许合理进退，但遇重复局面则截断或改选，避免推演一直循环同一套着法。
         """
         pv = []
         board = self.board.clone()
@@ -351,23 +391,27 @@ class Searcher:
             legal = generate_legal(board, board.turn)
             if not legal:
                 break
-            if move is None or move not in legal:
-                if not fill:
-                    break
-                origin = self.board
-                self.board = board
-                try:
-                    remain = max_len - ply
-                    bm, _, _ = self.root_search(max(1, min(remain, 3)))
-                except TimeUp:
-                    bm = None
-                finally:
-                    self.board = origin
-                move = bm
-                if move is None or move not in generate_legal(board, board.turn):
-                    break
-            pv.append(move)
-            board.apply(move)
+            forbidden = set()
+            chosen = None
+            for _ in range(len(legal) + 1):
+                if move is None or move not in legal or move in forbidden:
+                    if not fill:
+                        break
+                    move = self._pick_pv_fill(board, max_len - ply, forbidden)
+                    if move is None:
+                        break
+                if not self._pv_move_ok(board, move):
+                    forbidden.add(move)
+                    move = None
+                    if not fill:
+                        break
+                    continue
+                chosen = move
+                break
+            if chosen is None:
+                break
+            pv.append(chosen)
+            board.apply(chosen)
             entry = self._tt_probe(board.hash)
             move = entry[3] if entry else None
         return pv

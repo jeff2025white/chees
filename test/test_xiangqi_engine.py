@@ -397,5 +397,54 @@ class TestSeeAndDeep(unittest.TestCase):
         self.assertNotEqual(best.get("captured"), "马")
 
 
+class TestPvAntiOscillation(unittest.TestCase):
+    def test_single_retreat_allowed_cycle_blocked(self):
+        """单次原路退回允许；走回已出现局面才禁止。"""
+        from engine.search import Searcher
+        board = Board.from_fen("3k5/9/9/9/9/9/1R7/9/9/4K4 w - - 0 1")
+        rook_from = sq(6, 1)
+        rook_to = sq(5, 1)
+        first = (rook_from, rook_to)
+        self.assertIn(first, generate_legal(board))
+        board.apply(first)
+        king_move = (sq(0, 3), sq(1, 3))
+        self.assertIn(king_move, generate_legal(board))
+        board.apply(king_move)
+        back = (rook_to, rook_from)
+        # 车退回：尚未重复局面，应允许
+        self.assertFalse(Searcher._causes_repetition(board, back))
+        board.apply(back)
+        king_back = (sq(1, 3), sq(0, 3))
+        # 将也退回：回到出发局面，应禁止继续循环
+        self.assertTrue(Searcher._causes_repetition(board, king_back))
+
+    def test_extract_pv_allows_retreat_stops_cycle(self):
+        """TT 植入进退循环时：允许车退一步，但不得把闭环重复局面写进主变。"""
+        from engine.search import Searcher
+        board = Board.from_fen("3k5/9/9/9/9/9/1R7/9/9/4K4 w - - 0 1")
+        searcher = Searcher(board, time_limit=0.5, max_depth=4)
+        a = (sq(6, 1), sq(5, 1))
+        b = (sq(0, 3), sq(1, 3))
+        a2 = (sq(5, 1), sq(6, 1))
+        b2 = (sq(1, 3), sq(0, 3))
+        scratch = board.clone()
+        searcher._tt_store(scratch.hash, 4, 0, 0, a)
+        scratch.apply(a)
+        searcher._tt_store(scratch.hash, 4, 0, 0, b)
+        scratch.apply(b)
+        searcher._tt_store(scratch.hash, 4, 0, 0, a2)
+        scratch.apply(a2)
+        searcher._tt_store(scratch.hash, 4, 0, 0, b2)
+
+        pv = searcher.extract_pv(a, max_len=6, fill=True)
+        self.assertGreaterEqual(len(pv), 3)
+        self.assertEqual(pv[:3], [a, b, a2])
+        self.assertNotIn(b2, pv)
+        replay = board.clone()
+        for mv in pv:
+            replay.apply(mv)
+            self.assertFalse(replay.is_repetition(), f"PV 含重复局面: {pv}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
