@@ -21,19 +21,63 @@ import numpy as np
 
 from .constants import FEN_TO_PIECE, PIECE_NAMES
 
-# 基准分辨率（历史手机截图 720×1280；当前 images/* 多为 782×1332 模拟器）
+# 基准分辨率（历史手机截图 720×1280；ROI 比例仍相对此）
 _REF_W = 720.0
 _REF_H = 1280.0
-# 棋盘在整图中的相对布局（images/* 根目录 266 张、hit≥20 中位数标定）
-# 随图宽高缩放；换皮/改布局后需重测
-_BOARD_ROW0_ABS = 0.25443             # 首格中心 Y / 图高
-_BOARD_COL0_ABS = 0.07344             # 首格中心 X / 图宽
-_BOARD_CELL_W = 0.09782               # 格宽 / 图宽
+# 格网标定分辨率 = 雷电重开后的默认客户区（images/auto 2026-11-21 实测）
+# 截图宽高与此不符时，UI 应提醒并建议调回该尺寸或重测 _BOARD_*
+BOARD_CALIB_W = 722
+BOARD_CALIB_H = 1225
+# 棋盘相对布局：同上批 722×1225 对局图、棋子圆心联合拟合中位数
+# 随图宽高缩放；换皮/换默认分辨率后需重测
+_BOARD_ROW0_ABS = 0.25820             # 首格中心 Y / 图高
+_BOARD_COL0_ABS = 0.07191             # 首格中心 X / 图宽
+_BOARD_CELL_W = 0.09689               # 格宽 / 图宽
 _CELL_RATIO = _BOARD_CELL_W           # 兼容旧引用
 _ROI_Y0 = 101.0 / _REF_H
 _ROI_Y1 = 1264.0 / _REF_H
 _TOP_UI = 0.075                       # 顶部 UI 屏蔽比例（头像/比分区）
 _BOTTOM_UI = 0.92                     # 底部 UI 屏蔽比例（按钮区）
+
+
+def format_size_mismatch(width, height):
+    """截图尺寸与标定不符时返回提醒行列表，否则返回空列表。
+
+    供日志栏提示：比例缩放不能保证棋盘边距一致，易导致格网偏移。
+    """
+    w, h = int(width), int(height)
+    if w == BOARD_CALIB_W and h == BOARD_CALIB_H:
+        return []
+    lines = [
+        f"提醒 · 截图尺寸 {w}×{h} ≠ 标定 {BOARD_CALIB_W}×{BOARD_CALIB_H}"
+        f"（雷电默认客户区），棋盘定位可能不准",
+    ]
+    if w > 0 and h > 0:
+        ar = w / h
+        calib_ar = BOARD_CALIB_W / BOARD_CALIB_H
+        scale = (w / BOARD_CALIB_W + h / BOARD_CALIB_H) / 2.0
+        if abs(ar - calib_ar) <= 0.02 and abs(scale - 1.0) >= 0.02:
+            pct = abs(1.0 - scale) * 100.0
+            bigger = "放大" if scale > 1.0 else "缩小"
+            lines.append(
+                f"原因 · 客户区相对标定整体{bigger}约 {pct:.0f}%"
+                f"（纵横比仍接近）"
+            )
+        elif abs(ar - calib_ar) > 0.02:
+            lines.append(
+                f"原因 · 纵横比 {ar:.3f} 与标定 {calib_ar:.3f} 差较大"
+            )
+    lines.append(
+        f"建议 · ① 保持雷电客户区为 {BOARD_CALIB_W}×{BOARD_CALIB_H}"
+        f"（重开后的默认尺寸；勿拖改窗口）"
+    )
+    lines.append(
+        "建议 · ② 若长期改用其它分辨率：用新尺寸对局样张重测 "
+        "engine/recognize.py 的 _BOARD_ROW0_ABS / _BOARD_COL0_ABS / _BOARD_CELL_W"
+        f"，并把 BOARD_CALIB_W/H 改成新尺寸"
+    )
+    return lines
+
 
 RED_BACKROW = ["R", "N", "B", "A", "K", "A", "B", "N", "R"]
 BLACK_BACKROW = ["r", "n", "b", "a", "k", "a", "b", "n", "r"]

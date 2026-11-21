@@ -14,7 +14,7 @@ from engine.piece_model import clear_model_cache, load_piece_model, torch_availa
 from engine.recognize import _piece_masks, analyze_image, validate_grid
 import cv2
 
-# 标定分辨率下的自动截图（782×1332 系）
+# 标定分辨率下的自动截图（当前默认客户区 722×1225 系）
 OPENING = ROOT / "images" / "auto_20261118_172439.png"
 EARLY = ROOT / "images" / "auto_20261118_171632.png"
 

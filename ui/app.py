@@ -39,7 +39,14 @@ if _ROOT not in sys.path:
 
 from engine import decide_position
 from engine.fx_overlay import detect_board_fx
-from engine.recognize import analyze_array, analyze_image, annotate
+from engine.recognize import (
+    BOARD_CALIB_H,
+    BOARD_CALIB_W,
+    analyze_array,
+    analyze_image,
+    annotate,
+    format_size_mismatch,
+)
 from engine.turn_side import (
     TURN_DETECT_ENABLED,
     format_turn_log,
@@ -256,6 +263,7 @@ class ChessApp:
         self._last_grid_str = None               # 上一帧棋盘串（帧差）
         self._last_grid = None                   # 上一帧 grid（行棋方差分）
         self._auto_skip_reason = None            # 等待态日志去重
+        self._size_warn_key = None               # 尺寸不符提醒去重 (w,h)
         self._target_hwnd = None                 # 找到的目标游戏窗口句柄
 
         # 操作栏工作状态动画（等待 / 计算中）
@@ -490,7 +498,8 @@ class ChessApp:
         self.base_image = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         self.lbl_file.configure(text=f"{name}   ({self.index + 1}/{len(self.files)})")
         self._render()
-        self._log_step(f"已加载 · {name}")
+        self._log_step(f"已加载 · {name} · {bgr.shape[1]}×{bgr.shape[0]}")
+        self._log_size_mismatch(bgr.shape[1], bgr.shape[0], force=True)
         self.advice.show_hint("点击「计算」，生成本手直播解说建议。")
 
     def open_image(self):
@@ -711,7 +720,12 @@ class ChessApp:
         keep_txt = "不落盘" if keep <= 0 else f"保留最近{keep}张"
         win_title = self._hwnd_title(hwnd) or "?"
         self._write_log([])
+        self._size_warn_key = None
         self._log_step(f"启动自动监听 · 截图{keep_txt}")
+        self._log_step(
+            f"标定尺寸 · {BOARD_CALIB_W}×{BOARD_CALIB_H}"
+            f"（客户区不符时会提醒）",
+        )
         self._log_step(
             f"目标窗 · hwnd={int(hwnd)} · 「{win_title}」"
             f" · 关键字「{TARGET_WINDOW_NAME}」 · 深度{self.depth_var.get()}"
@@ -807,6 +821,9 @@ class ChessApp:
             r_cnt = sum(1 for row in analysis.grid for ch in row if ch in "RNBAKCP")
             b_cnt = sum(1 for row in analysis.grid for ch in row
                         if ch.islower() and ch != ".")
+
+            # 客户区尺寸偏离标定 → 提醒一次（换尺寸再提醒）
+            self.root.after(0, lambda w=fw, h=fh: self._log_size_mismatch(w, h))
 
             if not has_board:
                 # 无棋盘（首页/结算页等）→ 不触发计算，继续等下一帧
@@ -1183,6 +1200,9 @@ class ChessApp:
 
         # 对方行棋跳过搜索时 decision 为空，只展示原图
         if decision is None:
+            if analysis is not None and getattr(analysis, "image", None) is not None:
+                ih, iw = analysis.image.shape[:2]
+                self._log_size_mismatch(iw, ih, force=True)
             self.advice.show_hint("对方行棋中，暂不分析。轮到我方后再计算。")
             if auto_mode:
                 self._set_work("wait", "监听中 · 对方行棋")
@@ -1200,8 +1220,10 @@ class ChessApp:
         turn = inp.get("side_to_move", "red")
         turn_txt = "红方行棋" if turn == "red" else "黑方行棋"
         our_txt = "红" if our_side == "red" else "黑"
+        ih, iw = analysis.image.shape[:2]
         if img_name:
-            self._log_step(f"当前图片 · {img_name}")
+            self._log_step(f"当前图片 · {img_name} · {iw}×{ih}")
+        self._log_size_mismatch(iw, ih, force=True)
         self._log_step(
             f"识别结果 · 红{analysis.red_count}/黑{analysis.black_count}"
             f" · {side_txt}（我方={our_txt}） · {turn_txt}"
@@ -1302,6 +1324,18 @@ class ChessApp:
             f" · ring={m.get('ring_v_mean', '?')}/{m.get('ring_v_std', '?')}"
             f" · roi={m.get('roi_wh', '?')}"
         )
+
+    def _log_size_mismatch(self, width, height, *, force=False):
+        """截图尺寸与标定不符时写提醒+调整建议；同尺寸默认只提醒一次。"""
+        key = (int(width), int(height))
+        if key == (BOARD_CALIB_W, BOARD_CALIB_H):
+            self._size_warn_key = None
+            return
+        if not force and key == self._size_warn_key:
+            return
+        self._size_warn_key = key
+        for line in format_size_mismatch(width, height):
+            self._log_step(line, warn=True)
 
     def _log_step(self, msg, *, warn=False):
         """处理日志：一行一条，带时间戳；含诊断字段便于定位。"""
