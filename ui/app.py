@@ -13,9 +13,9 @@
     │  [◀]  文件名 (3/8)  [▶]      │                  │
     └──────────────────────────────┴──────────────────┘
 
-自动监听（Windows）：找「手游助手」窗口 → 每秒截客户区 → 特效过滤
-→ analyze_array → 主将判定棋盘 → 行棋方（头像绿边/局面差分，兜底我方）
-→ 对方行棋则跳过计算；我方行棋且 grid 变化 → decide + annotate。
+自动监听（Windows）：找「手游助手」窗口 → 每 0.5s 截客户区
+→ 特效过滤 → analyze_array → 主将判定棋盘 → 行棋方（头像绿量 / 局面差分）
+→ 我方棋子+全盘相对「上次开搜」未变则跳过；对方行棋不改已算基准（防漏算）；已在计算则等结果。
 默认不落盘；「自动截图」拉杆 >0 时写入 images/auto/ 并环形保留。
 本窗标题可显示为「QQ游戏」，与截图目标关键字分开。
 """
@@ -55,7 +55,14 @@ from engine.turn_side import (
     to_move_label,
 )
 from ui.advice import AdviceView
-from ui.prefs import get_depth, get_show_piece_labels, set_depth, set_show_piece_labels
+from ui.prefs import (
+    get_advice_enabled,
+    get_depth,
+    get_show_piece_labels,
+    set_advice_enabled,
+    set_depth,
+    set_show_piece_labels,
+)
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 # 本窗标题栏（可与截图目标不同，避免监听截到自己）
@@ -77,6 +84,8 @@ TITLE_FONT = ("Microsoft YaHei", 13, "bold")
 # 自动监听落盘：0=不保存（默认）；>0 时写入 images/auto/ 并只保留最近 N 张
 AUTO_SAVE_KEEP_DEFAULT = 0
 AUTO_SAVE_KEEP_MAX = 50
+# 自动截图间隔（秒）；计算中仍继续截图刷新画面，只是不重复开搜
+AUTO_CAPTURE_INTERVAL = 0.5
 
 
 # 启动窗口尺寸（物理像素）
@@ -259,9 +268,11 @@ class ChessApp:
         self._auto_running = False
         self._auto_thread = None
         self._auto_stop = threading.Event()
-        self._computing = threading.Event()     # 计算中 → 暂停截图
-        self._last_grid_str = None               # 上一帧棋盘串（帧差）
-        self._last_grid = None                   # 上一帧 grid（行棋方差分）
+        self._computing = threading.Event()     # 计算中（仍截图刷新，不重复开搜）
+        self._last_grid_str = None               # 上次「开始计算」时的全盘串（跳过判定用）
+        self._last_grid = None                   # 上一局面 grid（行棋方差分；对方跳过也可更新）
+        self._last_our_sig = None                # 上次「开始计算」时的我方棋子签名
+        self._avatar_boxes = None                # 双方头像框缓存（首次定位）
         self._auto_skip_reason = None            # 等待态日志去重
         self._size_warn_key = None               # 尺寸不符提醒去重 (w,h)
         self._target_hwnd = None                 # 找到的目标游戏窗口句柄
@@ -401,6 +412,20 @@ class ChessApp:
         )
         self.chk_labels.pack(fill="x", pady=(8, 0))
 
+        # 棋局解说生成/刷新（默认关；开后才写解说面板）
+        self._advice_enabled = get_advice_enabled(False)
+        self.advice_var = tk.BooleanVar(value=self._advice_enabled)
+        self.chk_advice = tk.Checkbutton(
+            mid_body,
+            text="生成棋局解说",
+            variable=self.advice_var,
+            command=self._on_advice_enabled_change,
+            bg=PANEL, fg=FG, selectcolor=BTN_BG,
+            activebackground=PANEL, activeforeground=FG,
+            font=UI_FONT, anchor="w", highlightthickness=0, bd=0,
+        )
+        self.chk_advice.pack(fill="x", pady=(4, 0))
+
         self.btn_play = FlatButton(
             mid_body, text="人机对弈 →", font=UI_FONT_B, command=self.open_play,
             activebackground=ACCENT, padx=8, pady=8,
@@ -411,13 +436,16 @@ class ChessApp:
         bottom.grid(row=2, column=0, sticky="nsew", padx=16, pady=(4, 12))
         self.log = self._mk_text_panel(bottom, "日志")
 
-        self.advice.write([
-            ("head", "直播解说面板\n"),
-            ("", f"1. 打开图片 / 监听；动画干扰时可点「重新截图」立刻重算\n"
-                 "2. 计算后这里给出口播建议、形势与推演\n"
-                 "3. 图上标注前两手走位\n"
-                 "（方向键 ◀ ▶ 可切换图片）"),
-        ])
+        if self._advice_enabled:
+            self.advice.write([
+                ("head", "直播解说面板\n"),
+                ("", "1. 打开图片 / 监听；动画干扰时可点「重新截图」立刻重算\n"
+                     "2. 计算后这里给出口播建议、形势与推演\n"
+                     "3. 图上标注前两手走位\n"
+                     "（方向键 ◀ ▶ 可切换图片）"),
+            ])
+        else:
+            self._show_advice_disabled()
         self._write_log([])
 
     def _mk_button_row(self, parent, specs):
@@ -474,7 +502,7 @@ class ChessApp:
             if f.lower().endswith(IMAGE_EXTS) and os.path.isfile(os.path.join(path, f))
         )
         if not self.files:
-            self.advice.show_warn("该目录下没有图片文件")
+            self._advice_update("show_warn", "该目录下没有图片文件")
             return
         self.index = self.files.index(select) if select in self.files else 0
         self._load_current()
@@ -500,7 +528,7 @@ class ChessApp:
         self._render()
         self._log_step(f"已加载 · {name} · {bgr.shape[1]}×{bgr.shape[0]}")
         self._log_size_mismatch(bgr.shape[1], bgr.shape[0], force=True)
-        self.advice.show_hint("点击「计算」，生成本手直播解说建议。")
+        self._advice_update("show_hint", "点击「计算」，生成本手直播解说建议。")
 
     def open_image(self):
         path = filedialog.askopenfilename(
@@ -643,7 +671,10 @@ class ChessApp:
             turn = resolve_to_move(
                 frame, analysis.grid, analysis.view_side,
                 prev_grid=self._last_grid,
+                avatar_boxes=self._avatar_boxes,
             )
+            if turn.get("avatar_boxes"):
+                self._avatar_boxes = turn["avatar_boxes"]
             self._last_grid_str = analysis.grid_str
             self._last_grid = [list(row) for row in analysis.grid]
             if TURN_DETECT_ENABLED and turn["to_move"] == "opp":
@@ -710,6 +741,8 @@ class ChessApp:
         self._auto_stop.clear()
         self._last_grid_str = None
         self._last_grid = None
+        self._last_our_sig = None
+        self._avatar_boxes = None
         self._auto_skip_reason = None  # 等待态去重：仅状态变化时打一行
         self._computing.clear()
         # UI 切换
@@ -730,7 +763,7 @@ class ChessApp:
             f"目标窗 · hwnd={int(hwnd)} · 「{win_title}」"
             f" · 关键字「{TARGET_WINDOW_NAME}」 · 深度{self.depth_var.get()}"
         )
-        self.advice.show_waiting()
+        self._advice_update("show_waiting")
         self._set_work("wait", "监听中 · 等待局面")
         # 等前台渲染就绪再开循环
         self.root.after(500, self._spawn_auto_thread)
@@ -746,29 +779,37 @@ class ChessApp:
         self._auto_running = False
         self._auto_stop.set()
         self._computing.set()          # 如果卡在计算等待，解除阻塞让循环退出
+        self._avatar_boxes = None
         self.btn_shot.configure(text="自动监听", activebackground=ACCENT)
         self.btn_open.configure(state="normal")
         self.btn_calc.configure(state="normal")
         self._set_work(None)
         self._log_step("停止自动监听")
 
+    @staticmethod
+    def _our_pieces_sig(grid, view_side: str) -> str:
+        """我方棋子签名：位置+兵种（view_side 为下方我方）。"""
+        our_upper = (view_side == "red")
+        parts = []
+        for r, row in enumerate(grid):
+            for c, ch in enumerate(row):
+                if not ch or ch == ".":
+                    continue
+                is_red = ch.isupper()
+                if is_red == our_upper:
+                    parts.append(f"{r}{c}{ch}")
+        return ",".join(parts)
+
     def _auto_loop(self):
-        """后台线程：每秒截图 → 特效过滤 → 识别 → 主将判断棋盘 → 帧差 → 触发计算。"""
+        """后台线程：0.5s 截图 → 识别 → 我方棋子差分；未变则保留标注不刷画面。"""
         import ctypes
         import numpy as np
 
+        interval = AUTO_CAPTURE_INTERVAL
         # 首次启动后等窗口稳定，再截第 1 帧
         time.sleep(0.3)
 
         while not self._auto_stop.is_set():
-            # 计算中 → 暂停截图，每 200ms 轮询一次
-            while self._computing.is_set():
-                if self._auto_stop.is_set():
-                    break
-                time.sleep(0.2)
-            if self._auto_stop.is_set():
-                break
-
             # 窗口有效性检查
             if not ctypes.windll.user32.IsWindow(self._target_hwnd):
                 self.root.after(0, self._auto_window_lost)
@@ -780,18 +821,19 @@ class ChessApp:
             except Exception as exc:                      # noqa: BLE001
                 self.root.after(0, lambda e=exc: self._log_step(
                     f"截图失败：{type(e).__name__}: {e}", warn=True))
-                time.sleep(1.0)
+                self._auto_stop.wait(interval)
                 continue
+
             frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
             fh, fw = frame.shape[:2]
 
-            # 中部墨云/吃/将军等特效 → 跳过识别与计算，等下一帧
+            # 中部墨云/吃/将军等特效 → 跳过识别与计算，等下一帧（不刷画面，保留标注）
             try:
                 fx = detect_board_fx(frame)
             except Exception as exc:                      # noqa: BLE001
                 self.root.after(0, lambda e=exc: self._log_step(
                     f"特效检测异常：{type(e).__name__}: {e}", warn=True))
-                time.sleep(1.0)
+                self._auto_stop.wait(interval)
                 continue
             if fx.get("dirty"):
                 level = fx.get("level", "?")
@@ -803,7 +845,7 @@ class ChessApp:
                         self._log_step(f"跳过 · 特效中 · {d}", warn=True),
                         self._set_work("wait", f"监听中 · 特效（{lv}）"),
                     ))
-                time.sleep(1.0)
+                self._auto_stop.wait(interval)
                 continue
 
             # 识别
@@ -812,7 +854,7 @@ class ChessApp:
             except Exception as exc:                      # noqa: BLE001
                 self.root.after(0, lambda e=exc, w=fw, h=fh: self._log_step(
                     f"识别异常 · 帧{w}x{h} · {type(e).__name__}: {e}", warn=True))
-                time.sleep(1.0)
+                self._auto_stop.wait(interval)
                 continue
 
             # 主将判断：同时有红帅 K 和黑将 k → 有棋盘
@@ -821,12 +863,13 @@ class ChessApp:
             r_cnt = sum(1 for row in analysis.grid for ch in row if ch in "RNBAKCP")
             b_cnt = sum(1 for row in analysis.grid for ch in row
                         if ch.islower() and ch != ".")
+            view = analysis.view_side
+            our_sig = self._our_pieces_sig(analysis.grid, view)
 
             # 客户区尺寸偏离标定 → 提醒一次（换尺寸再提醒）
             self.root.after(0, lambda w=fw, h=fh: self._log_size_mismatch(w, h))
 
             if not has_board:
-                # 无棋盘（首页/结算页等）→ 不触发计算，继续等下一帧
                 detail = (
                     f"帧{fw}x{fh} · 命中{analysis.hit}"
                     f" · 红{r_cnt}/黑{b_cnt}"
@@ -840,98 +883,164 @@ class ChessApp:
                         self._log_step(f"跳过 · 无棋盘 · {d}", warn=True),
                         self._set_work("wait", "监听中 · 无棋盘"),
                     ))
+                # 离开棋盘页时刷新原图
+                self.root.after(0, lambda p=pil_img: self._auto_show_raw(p))
                 self._last_grid_str = None
                 self._last_grid = None
-                time.sleep(1.0)
+                self._last_our_sig = None
+                self._avatar_boxes = None
+                self._auto_stop.wait(interval)
                 continue
 
-            # 行棋方：头像绿边 → 局面差分 → 兜底我方
+            # 行棋方：头像绿边（缓存方框）→ 局面差分 → 兜底我方
             turn = resolve_to_move(
                 frame, analysis.grid, analysis.view_side,
                 prev_grid=self._last_grid,
+                avatar_boxes=self._avatar_boxes,
             )
+            if turn.get("avatar_boxes"):
+                self._avatar_boxes = turn["avatar_boxes"]
             turn_txt = to_move_label(turn["to_move"])
 
-            # 跟上次棋盘比
-            changed = (self._last_grid_str is not None) and (grid_str != self._last_grid_str)
-            first_time = (self._last_grid_str is None)
+            first_time = self._last_our_sig is None
+            our_same = (not first_time) and (our_sig == self._last_our_sig)
+            full_changed = (
+                self._last_grid_str is not None and grid_str != self._last_grid_str
+            )
+            side_txt = "红方在下" if analysis.red_bottom else "黑方在下"
 
-            # 清除等待态去重（对方行棋且局面未变时保留「对方行棋」提示）
+            # 我方棋子未变 → 不刷画面（保留标注线）
+            # 且全盘未变 → 不必计算
+            if our_same and not full_changed:
+                reason = "our_same"
+                if reason != self._auto_skip_reason:
+                    self._auto_skip_reason = reason
+                    step = (
+                        f"我方棋子未变 · 跳过计算 · 保留标注 · 全盘亦同"
+                        f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
+                        f" · {side_txt} · 行棋={turn_txt}"
+                    )
+                    self.root.after(0, lambda s=step: (
+                        self._log_step(s),
+                        self._set_work(
+                            "wait",
+                            "监听中 · 计算中" if self._computing.is_set()
+                            else "监听中 · 等待局面",
+                        ),
+                    ))
+                self._auto_stop.wait(interval)
+                continue
+
+            # 我方未变但全盘有变 → 不刷画面；对方可能已动，继续判定是否计算
+            if our_same and full_changed:
+                reason = "our_same_board_changed"
+                if reason != self._auto_skip_reason:
+                    self._auto_skip_reason = reason
+                    tip = (
+                        f"我方棋子未变 · 全盘有变（对方可能已动）· 保留标注"
+                        f" · 帧{fw}x{fh} · 行棋={turn_txt}"
+                        f" · 继续判定是否计算"
+                    )
+                    self.root.after(0, lambda s=tip: self._log_step(s))
+            else:
+                # 我方棋子有变或首次 → 刷新原图（旧标注作废）
+                self.root.after(0, lambda p=pil_img: self._auto_show_raw(p))
+
+            # 需要关注的变化（我方棋子变 / 全盘变 / 首次）且已在计算 → 只等结果
+            if self._computing.is_set():
+                reason = "busy_wait"
+                if reason != self._auto_skip_reason:
+                    self._auto_skip_reason = reason
+                    why = (
+                        "首次" if first_time
+                        else ("我方棋子有变" if not our_same else "全盘有变")
+                    )
+                    step = (
+                        f"{why} · 已在计算，等待结果"
+                        f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
+                        f" · {side_txt} · 行棋={turn_txt}"
+                    )
+                    self.root.after(0, lambda s=step: (
+                        self._log_step(s, warn=True),
+                        self._set_work("wait", "监听中 · 计算中"),
+                    ))
+                self._auto_stop.wait(interval)
+                continue
+
+            # 清除等待态去重（进入新决策前）
             if self._auto_skip_reason is not None:
                 keep_opp = (
                     str(self._auto_skip_reason).startswith("opp_turn")
                     and turn["to_move"] == "opp"
-                    and not changed
-                    and not first_time
                 )
                 if not keep_opp:
                     self._auto_skip_reason = None
-                    if not self._computing.is_set() and turn["to_move"] == "our":
-                        self.root.after(
-                            0, lambda: self._set_work("wait", "监听中 · 等待局面"),
-                        )
 
-            # 局面未变：静默等待；首次/变化 → 视行棋方决定是否计算
-            if first_time or changed:
-                self.root.after(0, lambda p=pil_img: self._auto_show_raw(p))
-                side_txt = "红方在下" if analysis.red_bottom else "黑方在下"
-                # 先更新帧差基准（对方行棋跳过计算时也要跟上，便于下次差分）
-                self._last_grid_str = grid_str
+            if first_time:
+                change_txt = "首次识别"
+            elif not our_same:
+                change_txt = "我方棋子有变"
+            else:
+                change_txt = "全盘有变"
+
+            if TURN_DETECT_ENABLED and turn["to_move"] == "opp":
+                # 只更新差分用上一局面，不碰「已算基准」(_last_grid_str / _last_our_sig)
+                # 否则对方走完后基准已被写成新局，轮到我方时会被 our_same 永久跳过
                 self._last_grid = [list(row) for row in analysis.grid]
-
-                if TURN_DETECT_ENABLED and turn["to_move"] == "opp":
-                    reason = f"opp_turn:{turn['method']}"
-                    if reason != self._auto_skip_reason:
-                        self._auto_skip_reason = reason
-                        how = method_label(turn["method"])
-                        step = (
-                            f"{'首次识别' if first_time else '局面变化'}"
-                            f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
-                            f" · {side_txt} · 行棋={turn_txt} · 判定={how}"
-                            f" · 跳过计算"
-                        )
-                        self.root.after(0, lambda s=step: (
-                            self._log_step(s, warn=True),
-                            self._set_work("wait", "监听中 · 对方行棋"),
-                        ))
-                    # 等满 1 秒再截下一帧
-                    self._auto_stop.wait(1.0)
-                    continue
-
-                if TURN_DETECT_ENABLED:
+                reason = f"opp_turn:{turn['method']}"
+                if reason != self._auto_skip_reason:
+                    self._auto_skip_reason = reason
                     how = method_label(turn["method"])
-                    turn_part = f" · 行棋={turn_txt} · 判定={how}"
-                else:
-                    turn_part = ""
-                step = (
-                    f"{'首次识别' if first_time else '局面变化'}"
-                    f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
-                    f" · {side_txt} · 命中{analysis.hit}"
-                    f" · view={analysis.view_side}"
-                    f"{turn_part}"
-                    f" · 深度{self.depth_var.get()}"
-                    f" · 开始计算"
-                )
-                self.root.after(0, lambda s=step: self._begin_round(s))
-                self._computing.set()     # 计算期间暂停截图
-                self._busy = True         # 让轮询保持运行
-                self.root.after(80, self._poll_result)
-                # 可选落盘（默认不保存；计算用内存中的 analysis）
-                save_path = self._save_auto_frame_if_needed(pil_img)
-                if save_path:
-                    analysis.path = save_path
-                    self.root.after(0, lambda p=save_path: self._log_step(
-                        f"已落盘 · {os.path.basename(p)}"))
+                    step = (
+                        f"{change_txt}"
+                        f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
+                        f" · {side_txt} · 行棋={turn_txt} · 判定={how}"
+                        f" · 对方行棋，跳过计算（保留已算基准）"
+                    )
+                    self.root.after(0, lambda s=step: (
+                        self._log_step(s, warn=True),
+                        self._set_work("wait", "监听中 · 对方行棋"),
+                    ))
+                self._auto_stop.wait(interval)
+                continue
 
-                depth = self.depth_var.get()
-                threading.Thread(
-                    target=self._auto_calc_worker,
-                    args=(analysis, depth),
-                    daemon=True,
-                ).start()
+            # 我方行棋且需计算：此时才写入已算基准
+            self._last_grid_str = grid_str
+            self._last_grid = [list(row) for row in analysis.grid]
+            self._last_our_sig = our_sig
 
-            # 等满 1 秒再截下一帧
-            self._auto_stop.wait(1.0)
+            if TURN_DETECT_ENABLED:
+                how = method_label(turn["method"])
+                turn_part = f" · 行棋={turn_txt} · 判定={how}"
+            else:
+                turn_part = ""
+            step = (
+                f"{change_txt}"
+                f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
+                f" · {side_txt} · 命中{analysis.hit}"
+                f" · view={view}"
+                f"{turn_part}"
+                f" · 深度{self.depth_var.get()}"
+                f" · 开始计算"
+            )
+            self.root.after(0, lambda s=step: self._begin_round(s))
+            self._computing.set()
+            self._busy = True
+            self.root.after(80, self._poll_result)
+            save_path = self._save_auto_frame_if_needed(pil_img)
+            if save_path:
+                analysis.path = save_path
+                self.root.after(0, lambda p=save_path: self._log_step(
+                    f"已落盘 · {os.path.basename(p)}"))
+
+            depth = self.depth_var.get()
+            threading.Thread(
+                target=self._auto_calc_worker,
+                args=(analysis, depth),
+                daemon=True,
+            ).start()
+
+            self._auto_stop.wait(interval)
 
     @staticmethod
     def _auto_keep_label(n: int) -> str:
@@ -1007,17 +1116,17 @@ class ChessApp:
         except Exception as exc:                      # noqa: BLE001
             self._queue.put((None, None, None, exc, None))
         finally:
-            self._computing.clear()    # 解除截图暂停
+            self._computing.clear()    # 允许下一轮开搜
 
     def _auto_show_raw(self, pil_img):
-        """主线程：显示原始帧（不等计算完成）。"""
+        """主线程：用最新截图替换画面（仅我方棋子变化/无棋盘时调用）。"""
         self.base_image = pil_img
         self._render()
 
     def _begin_round(self, first_step=None):
-        """每轮计算开始：解说面板与日志一并清空，再写入本轮首条步骤。"""
+        """每轮计算开始：解说开则清空面板；日志始终清空后写本轮首条。"""
         self._set_work("calc", "计算中")
-        self.advice.clear_analyzing()
+        self._advice_update("clear_analyzing")
         self._write_log([])
         if first_step:
             self._log_step(first_step)
@@ -1072,6 +1181,36 @@ class ChessApp:
             "兵种文字：" + ("开" if self._show_piece_labels else "关")
         )
 
+    def _show_advice_disabled(self):
+        """解说关闭时的面板占位。"""
+        self.advice.write([
+            ("head", "棋局解说已关闭\n"),
+            ("", "在操作栏勾选「生成棋局解说」后，计算完成会生成并刷新口播文案。"),
+        ])
+
+    def _advice_update(self, method: str, *args, **kwargs):
+        """仅在解说开时刷新面板；关则忽略。"""
+        if not self._advice_enabled:
+            return None
+        return getattr(self.advice, method)(*args, **kwargs)
+
+    def _on_advice_enabled_change(self):
+        self._advice_enabled = bool(self.advice_var.get())
+        set_advice_enabled(self._advice_enabled)
+        self._log_step(
+            "棋局解说：" + ("开" if self._advice_enabled else "关")
+        )
+        if not self._advice_enabled:
+            self._show_advice_disabled()
+            return
+        # 打开：有现成结果则立刻生成，否则给提示
+        if self._analysis is not None and self._decision is not None:
+            self.advice.show_decision(self._analysis, self._decision)
+        elif self._busy:
+            self.advice.clear_analyzing()
+        else:
+            self.advice.show_hint("点击「计算」，生成本手直播解说建议。")
+
     def _refresh_annotation(self):
         """开关切换后，用当前分析结果重画标注图。"""
         if self._analysis is None:
@@ -1124,7 +1263,10 @@ class ChessApp:
             turn = resolve_to_move(
                 analysis.image, analysis.grid, analysis.view_side,
                 prev_grid=self._last_grid,
+                avatar_boxes=self._avatar_boxes,
             )
+            if turn.get("avatar_boxes"):
+                self._avatar_boxes = turn["avatar_boxes"]
             self._last_grid_str = analysis.grid_str
             self._last_grid = [list(row) for row in analysis.grid]
 
@@ -1188,7 +1330,7 @@ class ChessApp:
                 f"计算失败 · {img_name or '<auto>'} · {type(error).__name__}: {error}",
                 warn=True,
             )
-            self.advice.show_error(error)
+            self._advice_update("show_error", error)
             if not auto_mode:
                 messagebox.showerror("计算失败", str(error))
             return
@@ -1203,13 +1345,15 @@ class ChessApp:
             if analysis is not None and getattr(analysis, "image", None) is not None:
                 ih, iw = analysis.image.shape[:2]
                 self._log_size_mismatch(iw, ih, force=True)
-            self.advice.show_hint("对方行棋中，暂不分析。轮到我方后再计算。")
+            self._advice_update(
+                "show_hint", "对方行棋中，暂不分析。轮到我方后再计算。",
+            )
             if auto_mode:
                 self._set_work("wait", "监听中 · 对方行棋")
             return
 
-        # 棋局解说由 ui.advice 主输出；过程信息只进日志
-        self.advice.show_decision(analysis, decision)
+        # 棋局解说由 ui.advice 主输出（开关控制）；过程信息只进日志
+        self._advice_update("show_decision", analysis, decision)
         self._log_calc_process(analysis, decision, img_name)
 
     def _log_calc_process(self, analysis, decision, img_name=""):

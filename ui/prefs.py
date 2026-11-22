@@ -69,3 +69,16 @@ def get_show_piece_labels(default: bool = True) -> bool:
 def set_show_piece_labels(on: bool) -> None:
     """保存兵种文字开关。"""
     save_prefs(show_piece_labels=bool(on))
+
+
+def get_advice_enabled(default: bool = False) -> bool:
+    """是否生成/刷新棋局解说面板；默认关闭。"""
+    data = load_prefs()
+    if "advice_enabled" in data:
+        return bool(data["advice_enabled"])
+    return bool(default)
+
+
+def set_advice_enabled(on: bool) -> None:
+    """保存棋局解说开关。"""
+    save_prefs(advice_enabled=bool(on))
