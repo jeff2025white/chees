@@ -14,8 +14,8 @@
     └──────────────────────────────┴──────────────────┘
 
 自动监听（Windows）：找「手游助手」窗口 → 每 0.5s 截客户区
-→ 特效过滤 → analyze_array → 主将判定棋盘 → 行棋方（头像绿量 / 局面差分）
-→ 我方棋子+全盘相对「上次开搜」未变则跳过；对方行棋不改已算基准（防漏算）；已在计算则等结果。
+→ 特效过滤 → analyze_array → 主将判定棋盘 → 行棋方（头像绿量 / 局面差分，可关）
+→ 我方棋子+全盘相对「上次开搜」未变则跳过；对方行棋（判定开时）不改已算基准；已在计算则等结果。
 默认不落盘；「自动截图」拉杆 >0 时写入 images/auto/ 并环形保留。
 本窗标题可显示为「QQ游戏」，与截图目标关键字分开。
 """
@@ -47,8 +47,8 @@ from engine.recognize import (
     annotate,
     format_size_mismatch,
 )
+import engine.turn_side as turn_side
 from engine.turn_side import (
-    TURN_DETECT_ENABLED,
     format_turn_log,
     method_label,
     resolve_to_move,
@@ -59,9 +59,11 @@ from ui.prefs import (
     get_advice_enabled,
     get_depth,
     get_show_piece_labels,
+    get_turn_detect_enabled,
     set_advice_enabled,
     set_depth,
     set_show_piece_labels,
+    set_turn_detect_enabled,
 )
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -426,6 +428,21 @@ class ChessApp:
         )
         self.chk_advice.pack(fill="x", pady=(4, 0))
 
+        # 行棋方判定：开=对方行棋跳过；关=仍算着法（特效/无棋盘/局面未变等照常跳过）
+        self._turn_detect_enabled = get_turn_detect_enabled(True)
+        turn_side.TURN_DETECT_ENABLED = self._turn_detect_enabled
+        self.turn_detect_var = tk.BooleanVar(value=self._turn_detect_enabled)
+        self.chk_turn_detect = tk.Checkbutton(
+            mid_body,
+            text="判断行棋方（关则双方都算）",
+            variable=self.turn_detect_var,
+            command=self._on_turn_detect_change,
+            bg=PANEL, fg=FG, selectcolor=BTN_BG,
+            activebackground=PANEL, activeforeground=FG,
+            font=UI_FONT, anchor="w", highlightthickness=0, bd=0,
+        )
+        self.chk_turn_detect.pack(fill="x", pady=(4, 0))
+
         self.btn_play = FlatButton(
             mid_body, text="人机对弈 →", font=UI_FONT_B, command=self.open_play,
             activebackground=ACCENT, padx=8, pady=8,
@@ -653,9 +670,12 @@ class ChessApp:
         # 监听中：暂停自动截帧，避免与本次手动重算抢结果
         if self._auto_running:
             self._computing.set()
+        turn_hint = (
+            "识别行棋方" if turn_side.TURN_DETECT_ENABLED else "行棋判定关·仍计算"
+        )
         self._begin_round(
             f"重新截图 · {name}（{pil_img.width}×{pil_img.height}）"
-            f" · 深度{depth} · 识别行棋方"
+            f" · 深度{depth} · {turn_hint}"
         )
         self.root.after(80, self._poll_result)
         threading.Thread(
@@ -677,7 +697,7 @@ class ChessApp:
                 self._avatar_boxes = turn["avatar_boxes"]
             self._last_grid_str = analysis.grid_str
             self._last_grid = [list(row) for row in analysis.grid]
-            if TURN_DETECT_ENABLED and turn["to_move"] == "opp":
+            if turn_side.TURN_DETECT_ENABLED and turn["to_move"] == "opp":
                 # 对方走棋：只更新局面基准，不搜索
                 self._queue.put((
                     analysis, None,
@@ -983,7 +1003,7 @@ class ChessApp:
             else:
                 change_txt = "全盘有变"
 
-            if TURN_DETECT_ENABLED and turn["to_move"] == "opp":
+            if turn_side.TURN_DETECT_ENABLED and turn["to_move"] == "opp":
                 # 只更新差分用上一局面，不碰「已算基准」(_last_grid_str / _last_our_sig)
                 # 否则对方走完后基准已被写成新局，轮到我方时会被 our_same 永久跳过
                 self._last_grid = [list(row) for row in analysis.grid]
@@ -1004,16 +1024,16 @@ class ChessApp:
                 self._auto_stop.wait(interval)
                 continue
 
-            # 我方行棋且需计算：此时才写入已算基准
+            # 我方行棋（或判定关闭）且需计算：此时才写入已算基准
             self._last_grid_str = grid_str
             self._last_grid = [list(row) for row in analysis.grid]
             self._last_our_sig = our_sig
 
-            if TURN_DETECT_ENABLED:
+            if turn_side.TURN_DETECT_ENABLED:
                 how = method_label(turn["method"])
                 turn_part = f" · 行棋={turn_txt} · 判定={how}"
             else:
-                turn_part = ""
+                turn_part = " · 行棋判定=关"
             step = (
                 f"{change_txt}"
                 f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
@@ -1211,6 +1231,20 @@ class ChessApp:
         else:
             self.advice.show_hint("点击「计算」，生成本手直播解说建议。")
 
+    def _on_turn_detect_change(self):
+        """同步偏好与模块开关；关掉后不再因「对方行棋」跳过。"""
+        self._turn_detect_enabled = bool(self.turn_detect_var.get())
+        turn_side.TURN_DETECT_ENABLED = self._turn_detect_enabled
+        set_turn_detect_enabled(self._turn_detect_enabled)
+        if not self._turn_detect_enabled and self._auto_skip_reason and str(
+            self._auto_skip_reason
+        ).startswith("opp_turn"):
+            self._auto_skip_reason = None
+        self._log_step(
+            "行棋方判定："
+            + ("开（对方行棋跳过）" if self._turn_detect_enabled else "关（双方都算）")
+        )
+
     def _refresh_annotation(self):
         """开关切换后，用当前分析结果重画标注图。"""
         if self._analysis is None:
@@ -1270,7 +1304,7 @@ class ChessApp:
             self._last_grid_str = analysis.grid_str
             self._last_grid = [list(row) for row in analysis.grid]
 
-            if TURN_DETECT_ENABLED and turn["to_move"] == "opp":
+            if turn_side.TURN_DETECT_ENABLED and turn["to_move"] == "opp":
                 pil = Image.fromarray(
                     cv2.cvtColor(analysis.image, cv2.COLOR_BGR2RGB),
                 )

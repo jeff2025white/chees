@@ -82,3 +82,16 @@ def get_advice_enabled(default: bool = False) -> bool:
 def set_advice_enabled(on: bool) -> None:
     """保存棋局解说开关。"""
     save_prefs(advice_enabled=bool(on))
+
+
+def get_turn_detect_enabled(default: bool = True) -> bool:
+    """是否根据头像/差分判断行棋方；关则不因对方行棋跳过计算。默认开。"""
+    data = load_prefs()
+    if "turn_detect_enabled" in data:
+        return bool(data["turn_detect_enabled"])
+    return bool(default)
+
+
+def set_turn_detect_enabled(on: bool) -> None:
+    """保存行棋方判定开关。"""
+    save_prefs(turn_detect_enabled=bool(on))

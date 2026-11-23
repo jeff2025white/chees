@@ -8,7 +8,8 @@
 
 返回的 to_move 只会是 ``\"our\"`` / ``\"opp\"``，不会是 None。
 
-开关：``TURN_DETECT_ENABLED = False`` 时暂时关闭判定，一律视为我方行棋。
+开关：``TURN_DETECT_ENABLED = False`` 时关闭判定，一律视为我方行棋、不因对方跳过计算。
+界面「判断行棋方」勾选会读写该开关（偏好持久化）。
 """
 
 from __future__ import annotations
