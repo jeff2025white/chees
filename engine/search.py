@@ -6,6 +6,7 @@
 否则回退到本文件的纯 Python Searcher。
 """
 
+import threading
 import time
 
 from .constants import BLACK, CANNON, CHARIOT, HORSE, PAWN, PIECE_VALUE, RED
@@ -31,9 +32,45 @@ _TT_FLAG = [0] * TT_SIZE
 _TT_MOVE = [None] * TT_SIZE
 
 try:
+    from engine._xiangqi import bump_search_gen as _bump_search_gen
+    from engine._xiangqi import current_search_gen as _current_search_gen
     from engine._xiangqi import search_cells as _native_search_cells
 except ImportError:  # pragma: no cover - 未编译时回退
     _native_search_cells = None
+    _bump_search_gen = None
+    _current_search_gen = None
+
+_search_lock = threading.Lock()
+_accept_local = threading.local()
+_PY_GEN = 0
+
+
+class SearchCancelled(Exception):
+    """有更新的局面接上了，这一轮搜索作废。"""
+
+
+def cancel_running_search() -> int:
+    """打断正在跑的搜索，返回新世代。新线程必须 bind 这个值。"""
+    global _PY_GEN
+    if _bump_search_gen is not None:
+        return int(_bump_search_gen())
+    _PY_GEN += 1
+    return _PY_GEN
+
+
+def current_search_token() -> int:
+    if _current_search_gen is not None:
+        return int(_current_search_gen())
+    return _PY_GEN
+
+
+def bind_search_token(token) -> None:
+    """本线程只认这个世代；世代已变就不再搜索。"""
+    _accept_local.token = token
+
+
+def _bound_token():
+    return getattr(_accept_local, "token", None)
 
 
 def native_available() -> bool:
@@ -51,6 +88,7 @@ def _outcome_from_native(raw) -> "SearchOutcome":
         ranked=raw["ranked"],
         pv=raw["pv"],
         alt_depth=raw.get("alt_depth", 0),
+        threads=int(raw.get("threads") or 1),
     )
 
 
@@ -61,7 +99,7 @@ class TimeUp(Exception):
 class SearchOutcome:
     """搜索结果容器。ranked 中每项为 (着法, 评分, 评分是否精确)。"""
 
-    def __init__(self, best_move, score, depth, nodes, elapsed_ms, ranked, pv, alt_depth=0):
+    def __init__(self, best_move, score, depth, nodes, elapsed_ms, ranked, pv, alt_depth=0, threads=1):
         self.best_move = best_move
         self.score = score
         self.depth = depth
@@ -70,6 +108,7 @@ class SearchOutcome:
         self.ranked = ranked
         self.pv = pv
         self.alt_depth = alt_depth
+        self.threads = threads
 
     @property
     def mate_in(self):
@@ -82,7 +121,7 @@ class SearchOutcome:
 class Searcher:
     """一次搜索会话，内部维护置换表、杀手着法与历史启发表。"""
 
-    def __init__(self, board, time_limit: float = 3.0, max_depth: int = 8):
+    def __init__(self, board, time_limit: float = 3.0, max_depth: int = 9):
         self.board = board
         self.start = time.perf_counter()
         self.time_limit = time_limit
@@ -103,7 +142,12 @@ class Searcher:
         return time.perf_counter() - self.start
 
     def _time_check(self) -> None:
-        if (self.nodes & 511) == 0 and time.perf_counter() > self.deadline:
+        if (self.nodes & 511) != 0:
+            return
+        token = _bound_token()
+        if token is not None and token != current_search_token():
+            raise SearchCancelled
+        if time.perf_counter() > self.deadline:
             raise TimeUp
 
     def _tt_probe(self, key):
@@ -150,12 +194,13 @@ class Searcher:
                     # 深入对方底三行吃子降权
                     if to_row in opp_rows:
                         s -= 60000 if attacker_ptype == CANNON else 40000
-                    # 开局打兵：兵不在底三行，单独降权，避免炮/马贪吃打乱布局
-                    if victim_ptype == PAWN:
-                        if attacker_ptype == CANNON:
-                            s -= 55000
-                        else:
-                            s -= 35000
+                # 全程压低车马炮吃兵的排序，残局也不把贪兵放在车炮前面
+                if (victim_ptype == PAWN
+                        and attacker_ptype in (CANNON, HORSE, CHARIOT)):
+                    if is_open:
+                        s -= 55000 if attacker_ptype == CANNON else 35000
+                    else:
+                        s -= 30000 if attacker_ptype == CANNON else 20000
             elif mv == killers[0]:
                 s = 90000
             elif mv == killers[1]:
@@ -417,7 +462,7 @@ class Searcher:
         return pv
 
 
-def search(board, time_limit: float = 4.0, max_depth: int = 8,
+def search(board, time_limit: float = 4.0, max_depth: int = 9,
            top_n: int = 2, fill_pv: bool = True) -> SearchOutcome:
     """迭代加深搜索入口。
 
@@ -426,14 +471,21 @@ def search(board, time_limit: float = 4.0, max_depth: int = 8,
     top_n<=0 时跳过备选着法复核；fill_pv=False 时 PV 只跟置换表。
     若存在 engine._xiangqi，优先走原生核。
     """
-    if _native_search_cells is not None:
-        raw = _native_search_cells(
-            board.cells, board.turn, time_limit, max_depth, top_n, fill_pv)
-        return _outcome_from_native(raw)
-    return search_python(board, time_limit, max_depth, top_n, fill_pv)
+    token = _bound_token()
+    with _search_lock:
+        if token is not None and token != current_search_token():
+            raise SearchCancelled
+        if _native_search_cells is not None:
+            raw = _native_search_cells(
+                board.cells, board.turn, time_limit, max_depth, top_n, fill_pv,
+                -1 if token is None else int(token))
+            if token is not None and token != current_search_token():
+                raise SearchCancelled
+            return _outcome_from_native(raw)
+        return search_python(board, time_limit, max_depth, top_n, fill_pv)
 
 
-def search_python(board, time_limit: float = 4.0, max_depth: int = 8,
+def search_python(board, time_limit: float = 4.0, max_depth: int = 9,
                   top_n: int = 2, fill_pv: bool = True) -> SearchOutcome:
     """纯 Python 搜索（基准 / 回退路径）。"""
     searcher = Searcher(board, time_limit, max_depth)

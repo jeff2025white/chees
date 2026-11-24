@@ -31,6 +31,11 @@ _RED_CHARS = "RNBAKCP"
 _BLK_CHARS = "rnbakcp"
 _SHARED_PAIRS = (("R", "r"), ("N", "n"), ("C", "c"))  # 同字可跨色补漏
 _MAX_TEMPLATES_PER_TYPE = 8
+# 车/马复核只比这两类。每种留 4 张、墨迹平移 ±1、彩色不做平移。
+# 若只留 3 张，跳马会被判成车（见 test_20261118_jumped_horses_not_rooks）。
+_RN_TEMPLATE_LIMIT = 4
+_RN_INK_SHIFT = 1
+_RN_COLOR_SHIFT = 0
 
 # 墨迹 / 彩色融合权重（无彩色模板时自动退回纯墨迹）
 _INK_WEIGHT = 0.55
@@ -133,6 +138,13 @@ def load_color_templates():
     return templates
 
 
+def _as_f32(arr: np.ndarray) -> np.ndarray:
+    """matchTemplate 用的连续 float32；已是则直接复用。"""
+    if arr.dtype == np.float32 and arr.flags["C_CONTIGUOUS"]:
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
 def ncc(a: np.ndarray, b: np.ndarray) -> float:
     af = a.astype(np.float32)
     bf = b.astype(np.float32)
@@ -148,9 +160,7 @@ def ncc_best(ink: np.ndarray, tmpl: np.ndarray, max_shift: int = 2) -> float:
         return ncc(ink, tmpl)
     pad = int(max_shift)
     padded = cv2.copyMakeBorder(ink, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
-    res = cv2.matchTemplate(
-        padded.astype(np.float32), tmpl.astype(np.float32), cv2.TM_CCOEFF_NORMED
-    )
+    res = cv2.matchTemplate(_as_f32(padded), _as_f32(tmpl), cv2.TM_CCOEFF_NORMED)
     return float(res.max())
 
 
@@ -171,8 +181,8 @@ def color_ncc_best(patch: np.ndarray, tmpl: np.ndarray, max_shift: int = 1) -> f
     scores = []
     for i in range(3):
         res = cv2.matchTemplate(
-            padded[:, :, i].astype(np.float32),
-            tmpl[:, :, i].astype(np.float32),
+            _as_f32(padded[:, :, i]),
+            _as_f32(tmpl[:, :, i]),
             cv2.TM_CCOEFF_NORMED,
         )
         scores.append(float(res.max()))
@@ -287,6 +297,62 @@ def score_cell_types(ink, is_red, templates=None, color_bgr=None, color_template
         ink_s = ink_scores.get(ch, -0.2)
         col_s = color_scores.get(ch, -0.2)
         fused[ch] = _INK_WEIGHT * ink_s + _COLOR_WEIGHT * col_s
+    return fused
+
+
+def _rn_bank(templates, limit: int):
+    """车/马模板转成 float32，每种只留最近 limit 张。"""
+    bank = {}
+    for ch in ("R", "r", "N", "n"):
+        bank[ch] = [_as_f32(tmpl) for tmpl in templates.get(ch, [])[-limit:]]
+    return bank
+
+
+def score_rook_horse(ink, is_red, templates=None, color_bgr=None, color_templates=None) -> dict:
+    """只给车、马打模板分。供 CNN 车/马易混复核，不扫描其余兵种。"""
+    if templates is None:
+        templates = load_templates()
+    if color_templates is None:
+        color_templates = load_color_templates()
+    r_ch = "R" if is_red else "r"
+    n_ch = "N" if is_red else "n"
+    r_other = "r" if is_red else "R"
+    n_other = "n" if is_red else "N"
+    ink_bank = _rn_bank(templates, _RN_TEMPLATE_LIMIT)
+    color_bank = _rn_bank(color_templates, _RN_TEMPLATE_LIMIT)
+
+    def _best(sample, own, other, bank, color: bool):
+        best = -1.0
+        if sample is None:
+            return best
+        shift = _RN_COLOR_SHIFT if color else _RN_INK_SHIFT
+        scorer = color_ncc_best if color else ncc_best
+        for ch in (own, other):
+            for tmpl in bank.get(ch, []):
+                best = max(best, scorer(sample, tmpl, max_shift=shift))
+        return best
+
+    ink_scores = {}
+    color_scores = {}
+    for own, other in ((r_ch, r_other), (n_ch, n_other)):
+        ink_s = _best(ink, own, other, ink_bank, False)
+        if ink_s >= 0:
+            ink_scores[own] = ink_s
+        col_s = _best(color_bgr, own, other, color_bank, True)
+        if col_s >= 0:
+            color_scores[own] = col_s
+    if not color_scores:
+        return ink_scores
+    if not ink_scores:
+        return color_scores
+    fused = {}
+    for ch in (r_ch, n_ch):
+        if ch not in ink_scores and ch not in color_scores:
+            continue
+        fused[ch] = (
+            _INK_WEIGHT * ink_scores.get(ch, -0.2)
+            + _COLOR_WEIGHT * color_scores.get(ch, -0.2)
+        )
     return fused
 
 
@@ -730,7 +796,7 @@ def _refine_nr_with_templates(candidates, crop, row0, col0, cell, piece_masks_fn
         cy = row0 + r * cell
         ink = extract_cell_ink(crop, red_mask, black_mask, cx, cy, cell, is_red)
         color_bgr = extract_cell_color(crop, cx, cy, cell)
-        tmpl = score_cell_types(
+        tmpl = score_rook_horse(
             ink, is_red, templates, color_bgr=color_bgr, color_templates=color_templates)
         if not tmpl:
             out.append((r, c, scores, is_red))

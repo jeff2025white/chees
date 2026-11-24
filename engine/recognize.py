@@ -15,6 +15,7 @@
 """
 
 import os
+import time
 
 import cv2
 import numpy as np
@@ -814,10 +815,27 @@ def analyze_image(path):
 _TYPE_VOTE_BUF = []  # [(occ_key, grid_copy), ...]
 _TYPE_VOTE_MAX = 3
 _LAST_TRACK = None  # (occ_key, grid_copy)
+# 自动监听：颜色占用未变时沿用上一帧兵种，跳过 CNN / 车马模板
+_OCC_TYPES = None  # (occ_key, typed_grid)
 
 
 def _occupancy_key(grid_raw):
     return tuple("".join(row) for row in grid_raw)
+
+
+def _reuse_typed_grid(grid_raw):
+    """占用（空位 + 红/黑）与上一帧相同时，返回上一帧兵种网格。"""
+    if _OCC_TYPES is None:
+        return None
+    key, grid = _OCC_TYPES
+    if key != _occupancy_key(grid_raw):
+        return None
+    return [list(row) for row in grid]
+
+
+def _store_typed_grid(grid_raw, grid):
+    global _OCC_TYPES
+    _OCC_TYPES = (_occupancy_key(grid_raw), [list(row) for row in grid])
 
 
 def _occ_color(ch):
@@ -909,6 +927,16 @@ def analyze_array(img, path="<memory>"):
 
     用于每秒帧的自动监听场景，避免频繁 I/O。
     """
+    t0 = time.perf_counter()
+    last = t0
+
+    def lap():
+        nonlocal last
+        now = time.perf_counter()
+        ms = (now - last) * 1000.0
+        last = now
+        return ms
+
     h, w = img.shape[:2]
     y0, y1 = int(_ROI_Y0 * h), int(_ROI_Y1 * h)
     crop = img[y0:y1, 0:w]
@@ -916,21 +944,54 @@ def analyze_array(img, path="<memory>"):
 
     row0, col0, cell, _score, _hit = find_grid(
         crop, pieces=None, full_w=w, full_h=h, crop_y0=y0)
+    grid_ms = lap()
     pieces = detect_pieces(crop)
+    detect_ms = lap()
     grid_raw, _centers = occupy_from_pieces(pieces, row0, col0, cell)
+    occupy_ms = lap()
     # 圆检漏的亮底黑子（如士）：格心暗黑墨迹二次确认，不造空位假子
     grid_raw = enrich_occupancy_cell_masks(grid_raw, crop, row0, col0, cell)
+    enrich_ms = lap()
     hit = sum(1 for row in grid_raw for ch in row if ch != ".")
     score = float(hit)
 
     side = detect_our_side(grid_raw) or "red"
+    side_ms = lap()
 
-    grid = infer_pieces(grid_raw, side=side, crop=crop, row0=row0, col0=col0, cell=cell)
+    # 仅直播监听复用兵种。打开图片 / 重新截图仍完整识别。
+    live_auto = path == "<auto>"
+    reused = _reuse_typed_grid(grid_raw) if live_auto else None
+    if reused is None:
+        grid = infer_pieces(grid_raw, side=side, crop=crop, row0=row0, col0=col0, cell=cell)
+        types_mode = "全量"
+    else:
+        grid = reused
+        types_mode = "复用"
+    infer_ms = lap()
+    stabilize_ms = 0.0
     if path in ("<auto>", "<memory>") or (isinstance(path, str) and "auto" in path):
         grid = _stabilize_types(grid, grid_raw)
+        stabilize_ms = lap()
+    if live_auto:
+        _store_typed_grid(grid_raw, grid)
     valid, _msgs, violations = validate_grid(grid, side=side)
-    return Analysis(path, img, box, row0, col0, cell, grid_raw, grid,
-                    score, hit, side, valid=valid, violations=violations)
+    validate_ms = lap()
+    analysis = Analysis(path, img, box, row0, col0, cell, grid_raw, grid,
+                        score, hit, side, valid=valid, violations=violations)
+    analysis.timings = {
+        "grid_ms": grid_ms,
+        "detect_ms": detect_ms,
+        "occupy_ms": occupy_ms,
+        "enrich_ms": enrich_ms,
+        "side_ms": side_ms,
+        "infer_ms": infer_ms,
+        "stabilize_ms": stabilize_ms,
+        "validate_ms": validate_ms,
+        "total_ms": (time.perf_counter() - t0) * 1000.0,
+        "reused": types_mode == "复用",
+        "mode": types_mode,
+    }
+    return analysis
 
 
 # --------------------------------------------------------------------------

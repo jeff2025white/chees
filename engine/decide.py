@@ -178,7 +178,7 @@ def decide_position(
     side=None,
     view_side=None,
     time_limit: float = 4.0,
-    max_depth: int = 8,
+    max_depth: int = 9,
     top_n: int = 2,
     fill_pv: bool = True,
 ) -> dict:
@@ -361,6 +361,7 @@ def decide_position(
             "score_cp": outcome.score,
             "mate_in": outcome.mate_in,
             "book": from_book,
+            "threads": getattr(outcome, "threads", 1),
         },
         "verdict": verdict,
         "message": best["reason"],

@@ -8,7 +8,7 @@ cdef int DEEP_ARR[1440]
 cdef int PIECE_VAL[8]
 
 cdef void _init_tables() noexcept:
-    cdef int i
+    cdef int i, pt, pen, sq, rr, redp, blackp
     ZOBRIST[0][0] = 2686701686007980644ULL
     ZOBRIST[0][1] = 17922656775488616830ULL
     ZOBRIST[0][2] = 3731775833278846343ULL
@@ -2335,6 +2335,19 @@ cdef void _init_tables() noexcept:
     PIECE_VAL[2] = 200
     PIECE_VAL[3] = 200
     PIECE_VAL[4] = 400
-    PIECE_VAL[5] = 900
-    PIECE_VAL[6] = 450
+    PIECE_VAL[5] = 1200
+    PIECE_VAL[6] = 650
     PIECE_VAL[7] = 100
+    # 深入惩罚 = 子力的 20%。上面的常量表按旧子力生成，这里按新车/炮覆盖。
+    for pt in range(4, 7):
+        pen = PIECE_VAL[pt] / 5
+        if pen < 30:
+            pen = 30
+        redp = pt
+        blackp = 8 + pt
+        for sq in range(90):
+            rr = sq / 9
+            if rr <= 2:
+                DEEP_ARR[redp * 90 + sq] = -pen
+            if rr >= 7:
+                DEEP_ARR[blackp * 90 + sq] = pen

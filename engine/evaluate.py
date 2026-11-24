@@ -1,7 +1,7 @@
 """局面评估：子力价值 + 位置分（分兵种位置表）+ 开局深入惩罚。
 
 评分以红方视角计算（正数表示红方占优），搜索中按行棋方取正负。
-单位：厘兵（1 兵 = 100）。
+单位：厘兵。车 1200、炮 650，高于马。各阶段都压低吃兵收益，避免 5 分钟棋局里贪兵。
 
 evaluate() 单次扫盘融合子力/PST/出子/将帅安全/控线；
 开局时额外叠加深入惩罚（残局不扣，避免压制攻将）。
@@ -210,11 +210,22 @@ def _file_control_from_cols(file_red, file_black, file_blockers) -> int:
     return score
 
 
+# (计入的子力, 位置分百分比)。未过河兵位置分本就为 0，吃它只剩子力。
+# 残局与中局同一档：整局只有约 5 分钟，吃兵不按满值 100 计。
+_PAWN_OPENING = (30, 50)
+_PAWN_LATER = (45, 70)
+
+
+def _pawn_phase(opening: bool):
+    """返回 (保留子力, 位置分百分比)。开局更低，中局和残局同一档。"""
+    return _PAWN_OPENING if opening else _PAWN_LATER
+
+
 def evaluate(board) -> int:
     """返回红方视角的静态评分（厘兵）。
 
     优先使用 Board.base_score（子力+PST 增量），单次扫盘补算出子/将帅/控线；
-    仅开局叠加深入惩罚。
+    仅开局叠加深入惩罚。开局、中局、残局都把兵卒从满值里扣回一截。
     """
     cells = board.cells
     base = getattr(board, "base_score", None)
@@ -224,6 +235,7 @@ def evaluate(board) -> int:
         score = base
 
     opening = _is_opening(board)
+    pawn_phase = _pawn_phase(opening)
     red_a = red_e = black_a = black_e = 0
     devel = 0
 
@@ -253,6 +265,13 @@ def evaluate(board) -> int:
         if opening:
             # 开局才扣深入；残局不惩罚大子攻入底线
             score += _DEEP[p * SQUARES + sq]
+
+        if pawn_phase is not None and ptype == PAWN:
+            keep, scale = pawn_phase
+            pst = PST_FLAT[PAWN][sq if p < 8 else MIRROR[sq]]
+            # base_score 已含满值 100+位置分，这里扣到开局/中局的保留额
+            delta = (keep + pst * scale // 100) - (PIECE_VALUE[PAWN] + pst)
+            score += delta if p < 8 else -delta
 
         if ptype in (CHARIOT, CANNON):
             if p < 8:

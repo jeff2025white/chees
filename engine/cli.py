@@ -51,7 +51,7 @@ def main(argv=None) -> int:
     parser.add_argument("--side", help="轮到哪一方走：red / black（缺省取 FEN 中的行棋方）")
     parser.add_argument("--view-side", help="哪一方在图下方：red / black（缺省同 --side）")
     parser.add_argument("--time", type=float, default=4.0, help="搜索时间预算（秒），默认 4.0")
-    parser.add_argument("--depth", type=int, default=8, help="最大搜索深度，默认 8")
+    parser.add_argument("--depth", type=int, default=9, help="最大搜索深度，默认 9")
     parser.add_argument("--json", dest="json_path", help="把完整结果写入 JSON 文件")
     parser.add_argument("--demo", action="store_true", help="用初始局面跑一次")
     parser.add_argument("--quiet", action="store_true", help="不打印棋盘")

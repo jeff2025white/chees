@@ -16,12 +16,14 @@ except ImportError as exc:  # pragma: no cover
         "  python setup.py build_ext --inplace"
     ) from exc
 
+_WIN = __import__("sys").platform == "win32"
 extensions = [
     Extension(
         "engine._xiangqi",
         sources=[str(EXT_DIR / "_xiangqi.pyx")],
         include_dirs=[str(EXT_DIR)],
-        extra_compile_args=["-O3"] if __import__("sys").platform != "win32" else ["/O2"],
+        extra_compile_args=["/O2", "/openmp"] if _WIN else ["-O3", "-fopenmp"],
+        extra_link_args=[] if _WIN else ["-fopenmp"],
     )
 ]
 

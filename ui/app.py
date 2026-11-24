@@ -14,8 +14,8 @@
     └──────────────────────────────┴──────────────────┘
 
 自动监听（Windows）：找「手游助手」窗口 → 每 0.5s 截客户区
-→ 特效过滤 → analyze_array → 主将判定棋盘 → 行棋方（头像绿量 / 局面差分，可关）
-→ 我方棋子+全盘相对「上次开搜」未变则跳过；对方行棋（判定开时）不改已算基准；已在计算则等结果。
+→ 墨迹动画（开关，默认关）→ analyze_array → 主将判定棋盘 → 行棋方（头像绿量 / 局面差分，可关）
+→ 我方棋子+全盘相对「上次开搜」未变则跳过；对方行棋（判定开时）不改已算基准；计算中局面再变则打断并另开线程。
 默认不落盘；「自动截图」拉杆 >0 时写入 images/auto/ 并环形保留。
 本窗标题可显示为「QQ游戏」，与截图目标关键字分开。
 """
@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import cv2
 import tkinter as tk
@@ -58,10 +59,12 @@ from ui.advice import AdviceView
 from ui.prefs import (
     get_advice_enabled,
     get_depth,
+    get_fx_detect_enabled,
     get_show_piece_labels,
     get_turn_detect_enabled,
     set_advice_enabled,
     set_depth,
+    set_fx_detect_enabled,
     set_show_piece_labels,
     set_turn_detect_enabled,
 )
@@ -239,6 +242,87 @@ def _capture_window_client(hwnd):
     return ImageGrab.grab(bbox=box, all_screens=True)
 
 
+def _warm_recognizer():
+    """启动时加载兵种 CNN 和模板，第一次识别不再现场 import torch。"""
+    try:
+        from engine.piece_model import load_piece_model
+        from engine.piece_ocr import load_color_templates, load_templates
+
+        load_piece_model()
+        load_templates()
+        load_color_templates()
+    except Exception:
+        return
+
+
+def _fmt_ms(ms) -> str:
+    """耗时文本：不足 10ms 保留一位小数，超过 1s 用秒。"""
+    ms = float(ms or 0)
+    if ms >= 1000:
+        return f"{ms / 1000:.2f}s"
+    if ms >= 10:
+        return f"{ms:.0f}ms"
+    return f"{ms:.1f}ms"
+
+
+def _recog_note(analysis) -> str:
+    """识别分段耗时，供流程日志。"""
+    tm = getattr(analysis, "timings", None) or {}
+    mode = tm.get("mode") or ("复用" if tm.get("reused") else "全量")
+    flag = "合法" if getattr(analysis, "valid", True) else "未通过校验"
+    red_n = analysis.red_count if analysis is not None else "?"
+    black_n = analysis.black_count if analysis is not None else "?"
+    return (
+        f"{mode} · 格{_fmt_ms(tm.get('grid_ms', 0))}"
+        f" 圆{_fmt_ms(tm.get('detect_ms', 0))}"
+        f" 占{_fmt_ms(tm.get('occupy_ms', 0))}"
+        f" 补{_fmt_ms(tm.get('enrich_ms', 0))}"
+        f" 方{_fmt_ms(tm.get('side_ms', 0))}"
+        f" 种{_fmt_ms(tm.get('infer_ms', 0))}"
+        f" 稳{_fmt_ms(tm.get('stabilize_ms', 0))}"
+        f" 验{_fmt_ms(tm.get('validate_ms', 0))}"
+        f" · {flag} · 红{red_n}/黑{black_n}"
+    )
+
+
+class _Flow:
+    """一轮流程的分段计时。rows 为 (名称, 毫秒, 说明)。"""
+
+    def __init__(self, title: str):
+        self.title = title
+        self.t0 = time.perf_counter()
+        self._lap = self.t0
+        self.rows = []
+        self.exc_text = ""
+
+    def mark(self, name: str, note: str = "") -> None:
+        now = time.perf_counter()
+        self.rows.append((name, (now - self._lap) * 1000.0, note))
+        self._lap = now
+
+    def add(self, name: str, ms: float, note: str = "") -> None:
+        self.rows.append((name, float(ms), note))
+
+    def total_ms(self) -> float:
+        return (time.perf_counter() - self.t0) * 1000.0
+
+    def lines(self):
+        out = [self.title]
+        for name, ms, note in self.rows:
+            tail = f"  {note}" if note else ""
+            out.append(f"  {name:<4} {_fmt_ms(ms):>8}{tail}")
+        out.append(f"  {'合计':<4} {_fmt_ms(self.total_ms()):>8}")
+        return out
+
+    def one_line(self) -> str:
+        bits = []
+        for name, ms, note in self.rows:
+            extra = f" {note}" if note else ""
+            bits.append(f"{name}{_fmt_ms(ms)}{extra}")
+        bits.append(f"合计{_fmt_ms(self.total_ms())}")
+        return " · ".join(bits)
+
+
 class ChessApp:
     def __init__(self, root):
         self.root = root
@@ -270,7 +354,8 @@ class ChessApp:
         self._auto_running = False
         self._auto_thread = None
         self._auto_stop = threading.Event()
-        self._computing = threading.Event()     # 计算中（仍截图刷新，不重复开搜）
+        self._computing = threading.Event()     # 有搜索线程在跑
+        self._calc_seq = 0                       # 世代；旧结果对不上就丢弃
         self._last_grid_str = None               # 上次「开始计算」时的全盘串（跳过判定用）
         self._last_grid = None                   # 上一局面 grid（行棋方差分；对方跳过也可更新）
         self._last_our_sig = None                # 上次「开始计算」时的我方棋子签名
@@ -294,6 +379,11 @@ class ChessApp:
         default_dir = os.path.join(_ROOT, "images")
         if os.path.isdir(default_dir):
             self.load_directory(default_dir)
+
+        # 后台加载兵种模型，避免第一次点「计算」才 import torch
+        threading.Thread(
+            target=_warm_recognizer, name="piece-model", daemon=True,
+        ).start()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -428,7 +518,7 @@ class ChessApp:
         )
         self.chk_advice.pack(fill="x", pady=(4, 0))
 
-        # 行棋方判定：开=对方行棋跳过；关=仍算着法（特效/无棋盘/局面未变等照常跳过）
+        # 行棋方判定：开=对方行棋跳过；关=仍算着法（无棋盘/局面未变照常跳过；墨迹动画另有开关）
         self._turn_detect_enabled = get_turn_detect_enabled(True)
         turn_side.TURN_DETECT_ENABLED = self._turn_detect_enabled
         self.turn_detect_var = tk.BooleanVar(value=self._turn_detect_enabled)
@@ -442,6 +532,20 @@ class ChessApp:
             font=UI_FONT, anchor="w", highlightthickness=0, bd=0,
         )
         self.chk_turn_detect.pack(fill="x", pady=(4, 0))
+
+        # 墨迹动画：开=中部墨云/吃/将军时跳过本帧识别；默认关，直接识别
+        self._fx_detect_enabled = get_fx_detect_enabled(False)
+        self.fx_detect_var = tk.BooleanVar(value=self._fx_detect_enabled)
+        self.chk_fx_detect = tk.Checkbutton(
+            mid_body,
+            text="检测墨迹动画（开则跳过该帧）",
+            variable=self.fx_detect_var,
+            command=self._on_fx_detect_change,
+            bg=PANEL, fg=FG, selectcolor=BTN_BG,
+            activebackground=PANEL, activeforeground=FG,
+            font=UI_FONT, anchor="w", highlightthickness=0, bd=0,
+        )
+        self.chk_fx_detect.pack(fill="x", pady=(4, 0))
 
         self.btn_play = FlatButton(
             mid_body, text="人机对弈 →", font=UI_FONT_B, command=self.open_play,
@@ -609,27 +713,34 @@ class ChessApp:
         except OSError as exc:
             messagebox.showerror("截图失败", str(exc))
             return
-        self._log_step(f"重新截图 · 置前后抓取并计算（{TARGET_WINDOW_NAME}）")
+        flow = _Flow(f"重新截图 · {TARGET_WINDOW_NAME}")
         # 等窗口完成前台渲染再截，避免拿到旧帧或被本窗遮挡的画面
-        self.root.after(500, lambda: self._resnap_and_calc(hwnd))
+        self.root.after(500, lambda: self._resnap_and_calc(hwnd, flow))
 
-    def _resnap_and_calc(self, hwnd):
+    def _resnap_and_calc(self, hwnd, flow):
         """主线程：抓一帧 → 预览 → 后台识别计算。"""
         import ctypes
         import numpy as np
 
+        flow.add("等前台", 500, "置前后固定等待")
+        flow._lap = time.perf_counter()
         if self._busy:
             return
         if not ctypes.windll.user32.IsWindow(hwnd):
+            flow.mark("截图", "窗口已关闭")
+            self._log_flow(flow, warn=True)
             self._log_step("重新截图失败：目标窗口已关闭", warn=True)
             messagebox.showwarning("窗口丢失", f"{TARGET_WINDOW_NAME}窗口已关闭。")
             return
         try:
             pil_img = _capture_window_client(hwnd)
         except Exception as exc:                          # noqa: BLE001
+            flow.mark("截图", f"{type(exc).__name__}: {exc}")
+            self._log_flow(flow, warn=True)
             self._log_step(f"截图失败：{exc}", warn=True)
             messagebox.showerror("截图失败", str(exc))
             return
+        flow.mark("截图", f"{pil_img.width}×{pil_img.height}")
 
         folder = self.dir_path or os.path.join(_ROOT, "images")
         os.makedirs(folder, exist_ok=True)
@@ -638,9 +749,12 @@ class ChessApp:
         try:
             pil_img.save(save_path)
         except OSError as exc:
+            flow.mark("存盘", str(exc))
+            self._log_flow(flow, warn=True)
             self._log_step(f"截图保存失败：{exc}", warn=True)
             messagebox.showerror("截图失败", str(exc))
             return
+        flow.mark("存盘", os.path.basename(save_path))
 
         # 更新当前图片列表，但不走「请点计算」提示
         self.dir_path = folder
@@ -678,16 +792,20 @@ class ChessApp:
             f" · 深度{depth} · {turn_hint}"
         )
         self.root.after(80, self._poll_result)
+        seq, token = self._next_calc_seq()
         threading.Thread(
             target=self._resnap_calc_worker,
-            args=(frame, save_path, depth),
+            args=(frame, save_path, depth, flow, seq, token),
             daemon=True,
         ).start()
 
-    def _resnap_calc_worker(self, frame, path, max_depth):
+    def _resnap_calc_worker(self, frame, path, max_depth, flow, seq, token):
         """后台：对重新截取的帧做识别+搜索（对方行棋则跳过计算）。"""
+        from engine.search import SearchCancelled, bind_search_token
+        bind_search_token(token)
         try:
             analysis = analyze_array(frame, path=path)
+            flow.mark("识别", _recog_note(analysis))
             turn = resolve_to_move(
                 frame, analysis.grid, analysis.view_side,
                 prev_grid=self._last_grid,
@@ -697,38 +815,22 @@ class ChessApp:
                 self._avatar_boxes = turn["avatar_boxes"]
             self._last_grid_str = analysis.grid_str
             self._last_grid = [list(row) for row in analysis.grid]
+            flow.mark("行棋", self._turn_note(turn))
             if turn_side.TURN_DETECT_ENABLED and turn["to_move"] == "opp":
                 # 对方走棋：只更新局面基准，不搜索
-                self._queue.put((
-                    analysis, None,
-                    Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
-                    None, None,
-                ))
-                msg = format_turn_log(turn, action="对方行棋，跳过计算")
-                if msg:
-                    self.root.after(0, lambda m=msg: self._log_step(m, warn=True))
+                pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                flow.mark("搜索", "跳过 · 对方行棋")
+                self._queue_result(analysis, None, pil, None, None, flow, seq)
                 return
-            msg = format_turn_log(turn, action="开始计算")
-            if msg:
-                self.root.after(0, lambda m=msg: self._log_step(m))
-            time_limit = min(90.0, max(4.0, 2.5 * (3 ** (max_depth - 4))))
-            decision = decide_position(
-                grid=analysis.grid_str,
-                side=analysis.view_side,
-                view_side=analysis.view_side,
-                time_limit=time_limit,
-                max_depth=max_depth,
-                top_n=0,
-            )
-            vis = annotate(
-                analysis, decision, draw_labels=self._show_piece_labels,
-            )
-            pil = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-            self._queue.put((analysis, decision, pil, None, time_limit))
+            self._search_and_queue(analysis, max_depth, flow, seq)
+        except SearchCancelled:
+            flow.mark("搜索", "中止 · 局面已变")
+            self._queue_result(None, None, None, None, None, flow, seq)
         except Exception as exc:                      # noqa: BLE001
-            self._queue.put((None, None, None, exc, None))
+            self._fail_flow(flow, exc, seq)
         finally:
-            self._computing.clear()
+            if seq == self._calc_seq:
+                self._computing.clear()
 
     # --------------------------------------------------------- 自动监听
     def toggle_auto_listen(self):
@@ -798,7 +900,8 @@ class ChessApp:
         """停止自动监听。"""
         self._auto_running = False
         self._auto_stop.set()
-        self._computing.set()          # 如果卡在计算等待，解除阻塞让循环退出
+        self._next_calc_seq()          # 打断正在跑的搜索，结果不再上屏
+        self._computing.clear()
         self._avatar_boxes = None
         self.btn_shot.configure(text="自动监听", activebackground=ACCENT)
         self.btn_open.configure(state="normal")
@@ -835,47 +938,56 @@ class ChessApp:
                 self.root.after(0, self._auto_window_lost)
                 return
 
+            flow = _Flow("监听")
             # 截图（内存中 PIL → BGR ndarray，不落盘）
             try:
                 pil_img = _capture_window_client(self._target_hwnd)
             except Exception as exc:                      # noqa: BLE001
-                self.root.after(0, lambda e=exc: self._log_step(
-                    f"截图失败：{type(e).__name__}: {e}", warn=True))
+                flow.mark("截图", f"{type(exc).__name__}: {exc}")
+                self._log_listen(flow, "截图失败", warn=True)
                 self._auto_stop.wait(interval)
                 continue
+            flow.mark("截图", f"{pil_img.width}×{pil_img.height}")
 
             frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
             fh, fw = frame.shape[:2]
 
-            # 中部墨云/吃/将军等特效 → 跳过识别与计算，等下一帧（不刷画面，保留标注）
-            try:
-                fx = detect_board_fx(frame)
-            except Exception as exc:                      # noqa: BLE001
-                self.root.after(0, lambda e=exc: self._log_step(
-                    f"特效检测异常：{type(e).__name__}: {e}", warn=True))
-                self._auto_stop.wait(interval)
-                continue
-            if fx.get("dirty"):
-                level = fx.get("level", "?")
-                reason = f"fx:{level}"
-                if reason != self._auto_skip_reason:
-                    self._auto_skip_reason = reason
-                    detail = self._fx_log_detail(fx, fw, fh)
-                    self.root.after(0, lambda d=detail, lv=level: (
-                        self._log_step(f"跳过 · 特效中 · {d}", warn=True),
-                        self._set_work("wait", f"监听中 · 特效（{lv}）"),
-                    ))
-                self._auto_stop.wait(interval)
-                continue
+            # 墨迹动画开关打开时：中部墨云/吃/将军 → 跳过识别与计算
+            if not self._fx_detect_enabled:
+                flow.add("墨迹", 0, "关")
+            else:
+                try:
+                    fx = detect_board_fx(frame)
+                except Exception as exc:                  # noqa: BLE001
+                    flow.mark("墨迹", f"{type(exc).__name__}: {exc}")
+                    self._log_listen(flow, "特效检测异常", warn=True)
+                    self._auto_stop.wait(interval)
+                    continue
+                flow.mark(
+                    "墨迹",
+                    "干净" if not fx.get("dirty") else f"脏 {fx.get('level', '?')}",
+                )
+                if fx.get("dirty"):
+                    level = fx.get("level", "?")
+                    reason = f"fx:{level}"
+                    if reason != self._auto_skip_reason:
+                        self._auto_skip_reason = reason
+                        self.root.after(0, lambda lv=level: self._set_work(
+                            "wait", f"监听中 · 特效（{lv}）",
+                        ))
+                    self._log_listen(flow, f"跳过 · 特效 · {self._fx_log_detail(fx, fw, fh)}", warn=True)
+                    self._auto_stop.wait(interval)
+                    continue
 
             # 识别
             try:
                 analysis = analyze_array(frame, path="<auto>")
             except Exception as exc:                      # noqa: BLE001
-                self.root.after(0, lambda e=exc, w=fw, h=fh: self._log_step(
-                    f"识别异常 · 帧{w}x{h} · {type(e).__name__}: {e}", warn=True))
+                flow.mark("识别", f"{type(exc).__name__}: {exc}")
+                self._log_listen(flow, f"识别异常 · 帧{fw}x{fh}", warn=True)
                 self._auto_stop.wait(interval)
                 continue
+            flow.mark("识别", _recog_note(analysis))
 
             # 主将判断：同时有红帅 K 和黑将 k → 有棋盘
             grid_str = analysis.grid_str
@@ -899,10 +1011,8 @@ class ChessApp:
                 )
                 if self._auto_skip_reason != "no_board":
                     self._auto_skip_reason = "no_board"
-                    self.root.after(0, lambda d=detail: (
-                        self._log_step(f"跳过 · 无棋盘 · {d}", warn=True),
-                        self._set_work("wait", "监听中 · 无棋盘"),
-                    ))
+                    self.root.after(0, lambda: self._set_work("wait", "监听中 · 无棋盘"))
+                self._log_listen(flow, f"跳过 · 无棋盘 · {detail}", warn=True)
                 # 离开棋盘页时刷新原图
                 self.root.after(0, lambda p=pil_img: self._auto_show_raw(p))
                 self._last_grid_str = None
@@ -920,6 +1030,7 @@ class ChessApp:
             )
             if turn.get("avatar_boxes"):
                 self._avatar_boxes = turn["avatar_boxes"]
+            flow.mark("行棋", self._turn_note(turn))
             turn_txt = to_move_label(turn["to_move"])
 
             first_time = self._last_our_sig is None
@@ -935,19 +1046,12 @@ class ChessApp:
                 reason = "our_same"
                 if reason != self._auto_skip_reason:
                     self._auto_skip_reason = reason
-                    step = (
-                        f"我方棋子未变 · 跳过计算 · 保留标注 · 全盘亦同"
-                        f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
-                        f" · {side_txt} · 行棋={turn_txt}"
-                    )
-                    self.root.after(0, lambda s=step: (
-                        self._log_step(s),
-                        self._set_work(
-                            "wait",
-                            "监听中 · 计算中" if self._computing.is_set()
-                            else "监听中 · 等待局面",
-                        ),
-                    ))
+                    waiting = "监听中 · 计算中" if self._computing.is_set() else "监听中 · 等待局面"
+                    self.root.after(0, lambda w=waiting: self._set_work("wait", w))
+                self._log_listen(
+                    flow,
+                    f"跳过 · 局面未变 · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt} · {side_txt}",
+                )
                 self._auto_stop.wait(interval)
                 continue
 
@@ -966,26 +1070,17 @@ class ChessApp:
                 # 我方棋子有变或首次 → 刷新原图（旧标注作废）
                 self.root.after(0, lambda p=pil_img: self._auto_show_raw(p))
 
-            # 需要关注的变化（我方棋子变 / 全盘变 / 首次）且已在计算 → 只等结果
+            # 计算还没结束又变了局面：打断上一轮，下面另开线程算这一帧
             if self._computing.is_set():
-                reason = "busy_wait"
-                if reason != self._auto_skip_reason:
-                    self._auto_skip_reason = reason
-                    why = (
-                        "首次" if first_time
-                        else ("我方棋子有变" if not our_same else "全盘有变")
-                    )
-                    step = (
-                        f"{why} · 已在计算，等待结果"
-                        f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
-                        f" · {side_txt} · 行棋={turn_txt}"
-                    )
-                    self.root.after(0, lambda s=step: (
-                        self._log_step(s, warn=True),
-                        self._set_work("wait", "监听中 · 计算中"),
-                    ))
-                self._auto_stop.wait(interval)
-                continue
+                why = (
+                    "首次" if first_time
+                    else ("我方棋子有变" if not our_same else "全盘有变")
+                )
+                self._log_listen(
+                    flow,
+                    f"局面已变 · 另开计算 · {why} · 帧{fw}x{fh} · {side_txt} · 行棋={turn_txt}",
+                    warn=True,
+                )
 
             # 清除等待态去重（进入新决策前）
             if self._auto_skip_reason is not None:
@@ -1010,17 +1105,12 @@ class ChessApp:
                 reason = f"opp_turn:{turn['method']}"
                 if reason != self._auto_skip_reason:
                     self._auto_skip_reason = reason
-                    how = method_label(turn["method"])
-                    step = (
-                        f"{change_txt}"
-                        f" · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt}"
-                        f" · {side_txt} · 行棋={turn_txt} · 判定={how}"
-                        f" · 对方行棋，跳过计算（保留已算基准）"
-                    )
-                    self.root.after(0, lambda s=step: (
-                        self._log_step(s, warn=True),
-                        self._set_work("wait", "监听中 · 对方行棋"),
-                    ))
+                    self.root.after(0, lambda: self._set_work("wait", "监听中 · 对方行棋"))
+                self._log_listen(
+                    flow,
+                    f"跳过 · 对方行棋 · {change_txt} · 帧{fw}x{fh} · {side_txt}",
+                    warn=True,
+                )
                 self._auto_stop.wait(interval)
                 continue
 
@@ -1054,9 +1144,11 @@ class ChessApp:
                     f"已落盘 · {os.path.basename(p)}"))
 
             depth = self.depth_var.get()
+            flow.title = step
+            seq, token = self._next_calc_seq()
             threading.Thread(
                 target=self._auto_calc_worker,
-                args=(analysis, depth),
+                args=(analysis, depth, flow, seq, token),
                 daemon=True,
             ).start()
 
@@ -1115,28 +1207,26 @@ class ChessApp:
         self._prune_auto_saves(keep)
         return save_path
 
-    def _auto_calc_worker(self, analysis, max_depth):
+    def _auto_calc_worker(self, analysis, max_depth, flow, seq, token):
         """自动模式下的计算 worker：完成后恢复截图循环。"""
+        from engine.search import SearchCancelled, bind_search_token
+        bind_search_token(token)
         try:
-            # 用已经识别好的 analysis 直接算，不用再识别
-            time_limit = min(90.0, max(4.0, 2.5 * (3 ** (max_depth - 4))))
-            decision = decide_position(
-                grid=analysis.grid_str,
-                side=analysis.view_side,
-                view_side=analysis.view_side,
-                time_limit=time_limit,
-                max_depth=max_depth,
-                top_n=0,
-            )
-            vis = annotate(
-                analysis, decision, draw_labels=self._show_piece_labels,
-            )
-            pil = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-            self._queue.put((analysis, decision, pil, None, time_limit))
+            # 识别已在监听线程完成，这里只搜索和标注
+            self._search_and_queue(analysis, max_depth, flow, seq)
+        except SearchCancelled:
+            flow.mark("搜索", "中止 · 局面已变")
+            self._queue_result(None, None, None, None, None, flow, seq)
         except Exception as exc:                      # noqa: BLE001
-            self._queue.put((None, None, None, exc, None))
+            self._fail_flow(flow, exc, seq)
         finally:
-            self._computing.clear()    # 允许下一轮开搜
+            if seq == self._calc_seq:
+                self._computing.clear()
+
+    def _log_listen(self, flow, action, *, warn=False):
+        """监听帧一行：各段耗时 + 本帧结论。"""
+        line = f"{flow.one_line()} · {action}"
+        self.root.after(0, lambda s=line, w=warn: self._log_step(s, warn=w))
 
     def _auto_show_raw(self, pil_img):
         """主线程：用最新截图替换画面（仅我方棋子变化/无棋盘时调用）。"""
@@ -1144,10 +1234,10 @@ class ChessApp:
         self._render()
 
     def _begin_round(self, first_step=None):
-        """每轮计算开始：解说开则清空面板；日志始终清空后写本轮首条。"""
+        """每轮计算开始：解说开则清空面板；日志保留，用分隔线标出新一轮。"""
         self._set_work("calc", "计算中")
         self._advice_update("clear_analyzing")
-        self._write_log([])
+        self._log_step("——")
         if first_step:
             self._log_step(first_step)
 
@@ -1245,6 +1335,19 @@ class ChessApp:
             + ("开（对方行棋跳过）" if self._turn_detect_enabled else "关（双方都算）")
         )
 
+    def _on_fx_detect_change(self):
+        """墨迹动画检测：关则监听帧直接进入识别。"""
+        self._fx_detect_enabled = bool(self.fx_detect_var.get())
+        set_fx_detect_enabled(self._fx_detect_enabled)
+        if not self._fx_detect_enabled and self._auto_skip_reason and str(
+            self._auto_skip_reason
+        ).startswith("fx:"):
+            self._auto_skip_reason = None
+        self._log_step(
+            "墨迹动画检测："
+            + ("开（特效帧跳过）" if self._fx_detect_enabled else "关（照常识别）")
+        )
+
     def _refresh_annotation(self):
         """开关切换后，用当前分析结果重画标注图。"""
         if self._analysis is None:
@@ -1276,6 +1379,71 @@ class ChessApp:
         self.canvas.delete("all")
         self.canvas.create_image(cw // 2, ch // 2, image=self._photo, anchor="center")
 
+    def _turn_note(self, turn) -> str:
+        if not turn_side.TURN_DETECT_ENABLED:
+            return "关"
+        how = method_label(turn.get("method"))
+        who = to_move_label(turn.get("to_move"))
+        return f"{who} · {how}"
+
+    def _search_note(self, decision, max_depth, time_limit) -> str:
+        info = (decision or {}).get("search") or {}
+        src = "开局库" if info.get("book") else "搜索"
+        pv_len = len(((decision or {}).get("pv") or {}).get("chinese") or [])
+        cores = int(info.get("threads") or 1)
+        core_note = f" · {cores}核" if cores > 1 else ""
+        return (
+            f"滑条{max_depth} · 达到{info.get('depth', 0)}"
+            f" · 推演{pv_len}步 · {info.get('nodes', 0)}节点"
+            f" · 引擎{info.get('time_ms', 0)}ms · 预算{time_limit:.1f}s · {src}{core_note}"
+        )
+
+    def _next_calc_seq(self):
+        """打断当前搜索并分配新世代。返回 (seq, token)。"""
+        from engine.search import cancel_running_search
+        token = cancel_running_search()
+        self._calc_seq += 1
+        return self._calc_seq, token
+
+    def _queue_result(self, analysis, decision, pil, error, time_limit, flow, seq):
+        self._queue.put((analysis, decision, pil, error, time_limit, flow, seq))
+
+    def _fail_flow(self, flow, exc, seq):
+        flow.exc_text = traceback.format_exc()
+        flow.mark("失败", f"{type(exc).__name__}: {exc}")
+        self._queue_result(None, None, None, exc, None, flow, seq)
+
+    def _search_and_queue(self, analysis, max_depth, flow, seq):
+        """搜索 + 标注，结果入队。"""
+        time_limit = min(90.0, max(4.0, 2.5 * (3 ** (max_depth - 4))))
+        decision = decide_position(
+            grid=analysis.grid_str,
+            side=analysis.view_side,
+            view_side=analysis.view_side,
+            time_limit=time_limit,
+            max_depth=max_depth,
+            top_n=0,
+        )
+        flow.mark("搜索", self._search_note(decision, max_depth, time_limit))
+        vis = annotate(
+            analysis, decision, draw_labels=self._show_piece_labels,
+        )
+        pil = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+        flow.mark("标注")
+        self._queue_result(analysis, decision, pil, None, time_limit, flow, seq)
+
+    def _log_flow(self, flow, *, warn=False, skip_title=False):
+        if flow is None:
+            return
+        lines = flow.lines()
+        if skip_title and lines:
+            lines = lines[1:]
+        for line in lines:
+            self._log_step(line, warn=warn)
+        if flow.exc_text:
+            for tb_line in flow.exc_text.strip().splitlines()[-12:]:
+                self._log_step(tb_line, warn=True)
+
     # ---------------------------------------------------------------- 计算
     def calculate(self):
         if self._busy or not self.current_path:
@@ -1286,14 +1454,25 @@ class ChessApp:
         name = os.path.basename(self.current_path)
         depth = self.depth_var.get()
         path = self.current_path
-        self._begin_round(f"开始计算 · {name} · 深度{depth} · path={path}")
-        threading.Thread(target=self._calc_worker, args=(path, depth), daemon=True).start()
+        flow = _Flow(f"计算 · {name} · 深度{depth}")
+        self._begin_round(flow.title)
+        seq, token = self._next_calc_seq()
+        threading.Thread(
+            target=self._calc_worker, args=(path, depth, flow, seq, token), daemon=True,
+        ).start()
         self.root.after(80, self._poll_result)
 
-    def _calc_worker(self, path, max_depth):
+    def _calc_worker(self, path, max_depth, flow, seq, token):
         """后台线程：识别 → 行棋方判定 → 我方才搜索；结果进队列，不碰 Tk。"""
+        from engine.search import SearchCancelled, bind_search_token
+        bind_search_token(token)
         try:
-            analysis = analyze_image(path)
+            img = cv2.imread(path)
+            if img is None:
+                raise RuntimeError(f"无法读取图片: {path}")
+            flow.mark("读图", f"{img.shape[1]}×{img.shape[0]}")
+            analysis = analyze_array(img, path=path)
+            flow.mark("识别", _recog_note(analysis))
             turn = resolve_to_move(
                 analysis.image, analysis.grid, analysis.view_side,
                 prev_grid=self._last_grid,
@@ -1303,51 +1482,48 @@ class ChessApp:
                 self._avatar_boxes = turn["avatar_boxes"]
             self._last_grid_str = analysis.grid_str
             self._last_grid = [list(row) for row in analysis.grid]
+            flow.mark("行棋", self._turn_note(turn))
 
             if turn_side.TURN_DETECT_ENABLED and turn["to_move"] == "opp":
                 pil = Image.fromarray(
                     cv2.cvtColor(analysis.image, cv2.COLOR_BGR2RGB),
                 )
-                self._queue.put((analysis, None, pil, None, None))
-                msg = format_turn_log(turn, action="对方行棋，跳过计算")
-                if msg:
-                    self.root.after(0, lambda m=msg: self._log_step(m, warn=True))
+                flow.mark("搜索", "跳过 · 对方行棋")
+                self._queue_result(analysis, None, pil, None, None, flow, seq)
                 return
 
-            msg = format_turn_log(turn, action="开始搜索")
-            if msg:
-                self.root.after(0, lambda m=msg: self._log_step(m))
-            # time_limit 随 depth 指数扩展：每层耗时约上一层 3 倍，
-            # 每层 3 秒基准 × 2.5 留余量，最高 90 秒封顶避免太夸张。
-            time_limit = min(90.0, max(4.0, 2.5 * (3 ** (max_depth - 4))))
-            decision = decide_position(
-                grid=analysis.grid_str,
-                # 第一步固定为我方：图下方先走（与红黑无关）
-                side=analysis.view_side,
-                view_side=analysis.view_side,
-                time_limit=time_limit,
-                max_depth=max_depth,
-                top_n=0,
-            )
-            vis = annotate(
-                analysis, decision, draw_labels=self._show_piece_labels,
-            )
-            pil = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-            self._queue.put((analysis, decision, pil, None, time_limit))
+            self._search_and_queue(analysis, max_depth, flow, seq)
+        except SearchCancelled:
+            flow.mark("搜索", "中止 · 局面已变")
+            self._queue_result(None, None, None, None, None, flow, seq)
         except Exception as exc:                      # noqa: BLE001
-            self._queue.put((None, None, None, exc, None))
+            self._fail_flow(flow, exc, seq)
 
     def _poll_result(self):
         """主线程轮询：把后台结果取出来更新界面。"""
         try:
-            analysis, decision, pil, error, _tl = self._queue.get_nowait()
+            item = self._queue.get_nowait()
         except queue.Empty:
-            if self._busy:
+            if self._busy or self._computing.is_set():
                 self.root.after(80, self._poll_result)
             return
-        self._calc_done(analysis, decision, pil, error)
+        if len(item) == 7:
+            analysis, decision, pil, error, _tl, flow, seq = item
+        elif len(item) == 6:
+            analysis, decision, pil, error, _tl, flow = item
+            seq = self._calc_seq
+        else:
+            if self._busy or self._computing.is_set():
+                self.root.after(80, self._poll_result)
+            return
+        self._calc_done(analysis, decision, pil, error, flow, seq)
 
-    def _calc_done(self, analysis, decision, pil, error):
+    def _calc_done(self, analysis, decision, pil, error, flow=None, seq=None):
+        if seq != self._calc_seq:
+            self._log_step("上一轮中止 · 局面已变")
+            if self._busy or self._computing.is_set():
+                self.root.after(80, self._poll_result)
+            return
         auto_mode = self._auto_running
         self._busy = False
         self.btn_resnap.configure(state="normal")
@@ -1359,6 +1535,8 @@ class ChessApp:
             self._set_work("wait", "监听中 · 等待局面")
 
         img_name = os.path.basename(self.current_path or "")
+        if flow is not None:
+            self._log_flow(flow, warn=error is not None, skip_title=True)
         if error is not None:
             self._log_step(
                 f"计算失败 · {img_name or '<auto>'} · {type(error).__name__}: {error}",
@@ -1388,9 +1566,9 @@ class ChessApp:
 
         # 棋局解说由 ui.advice 主输出（开关控制）；过程信息只进日志
         self._advice_update("show_decision", analysis, decision)
-        self._log_calc_process(analysis, decision, img_name)
+        self._log_calc_process(analysis, decision, img_name, timed=flow is not None)
 
-    def _log_calc_process(self, analysis, decision, img_name=""):
+    def _log_calc_process(self, analysis, decision, img_name="", timed=False):
         """过程日志：识别概况 / 最佳着 / 搜索统计（不进解说面板）。"""
         side_txt = "红方在下" if analysis.red_bottom else "黑方在下"
         inp = decision.get("input") or {}
@@ -1420,6 +1598,8 @@ class ChessApp:
             f"最佳着 · {best.get('chinese', '?')} ({best.get('iccs', '?')})"
             f" · {best.get('score_text', '?')}"
         )
+        if timed:
+            return
         src = "开局库+" if search_info.get("book") else ""
         depth_n = search_info.get("depth", 0)
         nodes = search_info.get("nodes", 0)

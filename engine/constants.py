@@ -49,14 +49,15 @@ def opponent(color: int) -> int:
     return BLACK if color == RED else RED
 
 
-# 子力价值（单位：厘兵 centipawn，兵=100）。将帅不参与交换评估。
+# 子力价值（厘兵）。车、炮直线速度快，高于马。兵的名义值是 100，
+# 开局到残局的实际吃兵收益在评估里再压低。将帅不参与交换评估。
 PIECE_VALUE = {
     KING: 60000,
     ADVISOR: 200,
     ELEPHANT: 200,
     HORSE: 400,
-    CHARIOT: 900,
-    CANNON: 450,
+    CHARIOT: 1200,
+    CANNON: 650,
     PAWN: 100,
 }
 

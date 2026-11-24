@@ -1,4 +1,31 @@
 # Alpha-beta search with TT, null move, LMR, aspiration, quiescence.
+# 深度够时，根着法分到多个核；置换表按槽加锁。
+
+from libc.stdlib cimport malloc, free
+from cython.parallel cimport prange
+cimport openmp
+
+cdef extern from *:
+    """
+    #ifdef _MSC_VER
+    #include <intrin.h>
+    static void tt_acquire(volatile long* lock) {
+        while (_InterlockedCompareExchange(lock, 1, 0) != 0) {}
+    }
+    static void tt_release(volatile long* lock) {
+        _InterlockedExchange(lock, 0);
+    }
+    #else
+    static void tt_acquire(volatile long* lock) {
+        while (!__sync_bool_compare_and_swap(lock, 0, 1)) {}
+    }
+    static void tt_release(volatile long* lock) {
+        __sync_lock_release(lock);
+    }
+    #endif
+    """
+    void tt_acquire(long* lock) nogil
+    void tt_release(long* lock) nogil
 
 cdef enum:
     MATE_SCORE = 100000
@@ -20,6 +47,11 @@ cdef int TT_FROM[1048576]
 cdef int TT_TO[1048576]
 
 
+cdef int SEARCH_GEN = 0
+cdef long TT_SPIN[1024]
+cdef int ROOT_THREADS_CAP = 12
+
+
 cdef struct Searcher:
     CBoard board
     double start
@@ -28,11 +60,13 @@ cdef struct Searcher:
     int max_depth
     long long nodes
     bint aborted
+    int cancel_gen
     int killers_frm[64][2]
     int killers_to[64][2]
     int history[8100]
     int root_tt_frm
     int root_tt_to
+    int root_threads
 
 
 cdef inline double now_sec():
@@ -40,18 +74,15 @@ cdef inline double now_sec():
     return time.perf_counter()
 
 
-cdef void searcher_init(Searcher* s, CBoard* b, double time_limit, int max_depth):
-    cdef int i, j
+cdef void searcher_reset(Searcher* s, CBoard* b, int max_depth) noexcept nogil:
+    cdef int i
     board_clone(&s.board, b)
-    # Also copy hash history length 1 already done by clone; for search start we want full cells
-    s.start = now_sec()
-    s.time_limit = time_limit
-    s.deadline = s.start + time_limit
     s.max_depth = max_depth
     s.nodes = 0
     s.aborted = False
     s.root_tt_frm = -1
     s.root_tt_to = -1
+    s.root_threads = 1
     for i in range(MAX_PLY):
         s.killers_frm[i][0] = -1
         s.killers_to[i][0] = -1
@@ -61,9 +92,20 @@ cdef void searcher_init(Searcher* s, CBoard* b, double time_limit, int max_depth
         s.history[i] = 0
 
 
-cdef inline void time_check(Searcher* s):
-    if (s.nodes & 511) == 0 and now_sec() > s.deadline:
-        s.aborted = True
+cdef void searcher_init(Searcher* s, CBoard* b, double time_limit, int max_depth):
+    searcher_reset(s, b, max_depth)
+    s.start = now_sec()
+    s.time_limit = time_limit
+    s.deadline = s.start + time_limit
+    s.cancel_gen = SEARCH_GEN
+
+
+cdef inline void time_check(Searcher* s) noexcept nogil:
+    # 每 512 节点短暂拿回 GIL，监听线程才能打断这一轮
+    if (s.nodes & 511) == 0:
+        with gil:
+            if SEARCH_GEN != s.cancel_gen or now_sec() > s.deadline:
+                s.aborted = True
 
 
 cdef inline void tt_clear():
@@ -73,33 +115,39 @@ cdef inline void tt_clear():
 
 
 cdef inline bint tt_probe(unsigned long long key, int* depth, int* score, int* flag,
-                          int* frm, int* to):
+                          int* frm, int* to) noexcept nogil:
     cdef int i = <int>(key & TT_MASK)
+    cdef int lane = i & 1023
+    cdef bint hit = False
+    tt_acquire(&TT_SPIN[lane])
     if TT_KEY[i] == key and TT_DEPTH[i] >= 0:
         depth[0] = TT_DEPTH[i]
         score[0] = TT_SCORE[i]
         flag[0] = TT_FLAG[i]
         frm[0] = TT_FROM[i]
         to[0] = TT_TO[i]
-        return True
-    return False
+        hit = True
+    tt_release(&TT_SPIN[lane])
+    return hit
 
 
 cdef inline void tt_store(unsigned long long key, int depth, int score, int flag,
-                          int frm, int to):
+                          int frm, int to) noexcept nogil:
     cdef int i = <int>(key & TT_MASK)
-    if TT_KEY[i] == key and TT_DEPTH[i] > depth:
-        return
-    TT_KEY[i] = key
-    TT_DEPTH[i] = depth
-    TT_SCORE[i] = score
-    TT_FLAG[i] = flag
-    TT_FROM[i] = frm
-    TT_TO[i] = to
+    cdef int lane = i & 1023
+    tt_acquire(&TT_SPIN[lane])
+    if not (TT_KEY[i] == key and TT_DEPTH[i] > depth):
+        TT_KEY[i] = key
+        TT_DEPTH[i] = depth
+        TT_SCORE[i] = score
+        TT_FLAG[i] = flag
+        TT_FROM[i] = frm
+        TT_TO[i] = to
+    tt_release(&TT_SPIN[lane])
 
 
 cdef void order_moves(Searcher* s, int* frms, int* tos, int n, int ply,
-                      int tt_frm, int tt_to):
+                      int tt_frm, int tt_to) noexcept nogil:
     cdef int scores[MAX_MOVES]
     cdef int i, j, victim, attacker_ptype, sc, best_i, tmp
     cdef bint is_open = board_is_opening(&s.board)
@@ -124,12 +172,14 @@ cdef void order_moves(Searcher* s, int* frms, int* tos, int n, int ply,
                         sc -= 60000
                     else:
                         sc -= 40000
-                # 开局打兵降权（兵线不在底三行）
-                if (victim & 7) == PAWN:
-                    if attacker_ptype == CANNON:
-                        sc -= 55000
-                    else:
-                        sc -= 35000
+            # 全程压低车马炮吃兵的排序，残局也不把贪兵放在车炮前面
+            if ((victim & 7) == PAWN
+                    and (attacker_ptype == CANNON or attacker_ptype == HORSE
+                         or attacker_ptype == CHARIOT)):
+                if is_open:
+                    sc -= 55000 if attacker_ptype == CANNON else 35000
+                else:
+                    sc -= 30000 if attacker_ptype == CANNON else 20000
         elif ply < MAX_PLY and frms[i] == s.killers_frm[ply][0] and tos[i] == s.killers_to[ply][0]:
             sc = 90000
         elif ply < MAX_PLY and frms[i] == s.killers_frm[ply][1] and tos[i] == s.killers_to[ply][1]:
@@ -150,7 +200,7 @@ cdef void order_moves(Searcher* s, int* frms, int* tos, int n, int ply,
             tmp = tos[i]; tos[i] = tos[best_i]; tos[best_i] = tmp
 
 
-cdef int quiesce(Searcher* s, int alpha, int beta, int ply, int qdepth):
+cdef int quiesce(Searcher* s, int alpha, int beta, int ply, int qdepth) noexcept nogil:
     cdef int stand, checked, qcap, n, i, victim, score
     cdef int frms[MAX_MOVES], tos[MAX_MOVES]
     s.nodes += 1
@@ -198,7 +248,7 @@ cdef int quiesce(Searcher* s, int alpha, int beta, int ply, int qdepth):
     return alpha
 
 
-cdef int negamax(Searcher* s, int depth, int alpha, int beta, int ply, bint allow_null):
+cdef int negamax(Searcher* s, int depth, int alpha, int beta, int ply, bint allow_null) noexcept nogil:
     cdef int key_depth, key_score, key_flag, tt_frm, tt_to
     cdef unsigned long long key
     cdef bint checked
@@ -298,9 +348,146 @@ cdef int negamax(Searcher* s, int depth, int alpha, int beta, int ply, bint allo
     return best
 
 
+cdef bint root_search_parallel(Searcher* s, int depth, int alpha, int beta,
+                               int* frms, int* tos, int n,
+                               int* out_frm, int* out_to, int* out_score,
+                               int* rfrms, int* rtos, int* rscores, int* rexact,
+                               int* rn) noexcept nogil:
+    """第 1 手定窗口，其余手零窗口分到多核，失败高的再单核重搜。"""
+    cdef int procs, nthreads, i, score, prev_alpha, alpha_now
+    cdef int best_score, best_frm, best_to
+    cdef Searcher* pool
+    cdef int* par_score
+    cdef int* par_ok
+
+    procs = openmp.omp_get_num_procs()
+    nthreads = procs if procs < ROOT_THREADS_CAP else ROOT_THREADS_CAP
+    if nthreads > n - 1:
+        nthreads = n - 1
+    if nthreads < 2:
+        return False
+
+    pool = <Searcher*>malloc(n * sizeof(Searcher))
+    par_score = <int*>malloc(n * sizeof(int))
+    par_ok = <int*>malloc(n * sizeof(int))
+    if pool == NULL or par_score == NULL or par_ok == NULL:
+        if pool != NULL:
+            free(pool)
+        if par_score != NULL:
+            free(par_score)
+        if par_ok != NULL:
+            free(par_ok)
+        return False
+
+    s.root_threads = nthreads
+    prev_alpha = alpha
+    board_apply(&s.board, frms[0], tos[0])
+    score = -negamax(s, depth - 1, -beta, -alpha, 1, True)
+    board_undo(&s.board)
+    if s.aborted:
+        out_frm[0] = frms[0]
+        out_to[0] = tos[0]
+        out_score[0] = score
+        rfrms[0] = frms[0]
+        rtos[0] = tos[0]
+        rscores[0] = score
+        rexact[0] = 0
+        rn[0] = 1
+        free(pool)
+        free(par_score)
+        free(par_ok)
+        return True
+
+    best_score = score
+    best_frm = frms[0]
+    best_to = tos[0]
+    rfrms[0] = frms[0]
+    rtos[0] = tos[0]
+    rscores[0] = score
+    rexact[0] = 1 if score > prev_alpha else 0
+    rn[0] = 1
+    if score >= beta:
+        out_frm[0] = best_frm
+        out_to[0] = best_to
+        out_score[0] = best_score
+        s.root_tt_frm = best_frm
+        s.root_tt_to = best_to
+        free(pool)
+        free(par_score)
+        free(par_ok)
+        return True
+    alpha_now = alpha
+    if score > alpha_now:
+        alpha_now = score
+        s.root_tt_frm = best_frm
+        s.root_tt_to = best_to
+
+    if alpha_now <= -INF_SCORE // 2:
+        free(pool)
+        free(par_score)
+        free(par_ok)
+        s.root_threads = 1
+        return False
+
+    for i in prange(1, n, num_threads=nthreads, schedule='dynamic'):
+        searcher_reset(&pool[i], &s.board, s.max_depth)
+        pool[i].time_limit = s.time_limit
+        pool[i].deadline = s.deadline
+        pool[i].start = s.start
+        pool[i].cancel_gen = s.cancel_gen
+        board_apply(&pool[i].board, frms[i], tos[i])
+        par_score[i] = -negamax(&pool[i], depth - 1, -(alpha_now + 1), -alpha_now, 1, True)
+        par_ok[i] = 0 if pool[i].aborted else 1
+
+    for i in range(1, n):
+        s.nodes += pool[i].nodes
+        if not par_ok[i]:
+            s.aborted = True
+    if SEARCH_GEN != s.cancel_gen:
+        s.aborted = True
+    if not s.aborted:
+        for i in range(1, n):
+            if par_score[i] <= alpha_now:
+                rfrms[rn[0]] = frms[i]
+                rtos[rn[0]] = tos[i]
+                rscores[rn[0]] = par_score[i]
+                rexact[rn[0]] = 0
+                rn[0] += 1
+                continue
+            prev_alpha = alpha_now
+            board_apply(&s.board, frms[i], tos[i])
+            score = -negamax(s, depth - 1, -beta, -alpha_now, 1, True)
+            board_undo(&s.board)
+            if s.aborted:
+                break
+            rfrms[rn[0]] = frms[i]
+            rtos[rn[0]] = tos[i]
+            rscores[rn[0]] = score
+            rexact[rn[0]] = 1 if score > prev_alpha else 0
+            rn[0] += 1
+            if score > best_score:
+                best_score = score
+                best_frm = frms[i]
+                best_to = tos[i]
+                s.root_tt_frm = best_frm
+                s.root_tt_to = best_to
+            if score > alpha_now:
+                alpha_now = score
+                if alpha_now >= beta:
+                    break
+
+    out_frm[0] = best_frm
+    out_to[0] = best_to
+    out_score[0] = best_score
+    free(pool)
+    free(par_score)
+    free(par_ok)
+    return True
+
+
 cdef int root_search(Searcher* s, int depth, int alpha, int beta,
                      int* out_frm, int* out_to, int* out_score,
-                     int* rfrms, int* rtos, int* rscores, int* rexact, int* rn):
+                     int* rfrms, int* rtos, int* rscores, int* rexact, int* rn) noexcept nogil:
     cdef int frms[MAX_MOVES], tos[MAX_MOVES]
     cdef int n, i, prev_alpha, score
     cdef int best_score = -INF_SCORE
@@ -316,6 +503,12 @@ cdef int root_search(Searcher* s, int depth, int alpha, int beta,
 
     order_moves(s, frms, tos, n, 0, s.root_tt_frm, s.root_tt_to)
     rn[0] = 0
+    if depth >= 4 and n >= 6 and root_search_parallel(
+            s, depth, alpha, beta, frms, tos, n,
+            out_frm, out_to, out_score, rfrms, rtos, rscores, rexact, rn):
+        return 1
+    rn[0] = 0
+    s.root_threads = 1
     for i in range(n):
         prev_alpha = alpha
         board_apply(&s.board, frms[i], tos[i])

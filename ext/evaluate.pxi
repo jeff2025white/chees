@@ -8,7 +8,8 @@ cdef int evaluate_board(CBoard* b) noexcept nogil:
     cdef int red_a = 0, red_e = 0, black_a = 0, black_e = 0, devel = 0
     cdef int file_red_ch[9], file_red_ca[9], file_black_ch[9], file_black_ca[9]
     cdef int file_blockers[9]
-    cdef int sq, p, ptype, r, c, open_bonus, center, i
+    cdef int sq, p, ptype, r, c, open_bonus, center, i, pst, delta
+    cdef int pawn_keep, pawn_scale
 
     for c in range(COLS):
         file_red_ch[c] = 0
@@ -16,6 +17,14 @@ cdef int evaluate_board(CBoard* b) noexcept nogil:
         file_black_ch[c] = 0
         file_black_ca[c] = 0
         file_blockers[c] = 0
+
+    # 吃兵全程压低。开局更低；中局和残局同一档，不恢复满值 100。
+    if opening:
+        pawn_keep = 30
+        pawn_scale = 50
+    else:
+        pawn_keep = 45
+        pawn_scale = 70
 
     if opening:
         if cells[82] == HORSE:
@@ -51,6 +60,17 @@ cdef int evaluate_board(CBoard* b) noexcept nogil:
 
         if opening:
             score += DEEP_ARR[p * SQUARES + sq]
+
+        if pawn_keep >= 0 and ptype == PAWN:
+            if p < 8:
+                pst = PST_FLAT_ARR[PAWN][sq]
+            else:
+                pst = PST_FLAT_ARR[PAWN][MIRROR_ARR[sq]]
+            delta = (pawn_keep + pst * pawn_scale / 100) - (PIECE_VAL[PAWN] + pst)
+            if p < 8:
+                score += delta
+            else:
+                score -= delta
 
         if p < 8:
             if ptype == ADVISOR and r >= 7:

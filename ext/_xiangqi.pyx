@@ -49,8 +49,8 @@ def evaluate_cells(cells, int turn):
     return evaluate_board(&b)
 
 
-def search_cells(cells, int turn, double time_limit=4.0, int max_depth=8,
-                 int top_n=2, bint fill_pv=True):
+def search_cells(cells, int turn, double time_limit=4.0, int max_depth=9,
+                 int top_n=2, bint fill_pv=True, int cancel_gen=-1):
     """Run iterative-deepening search; return a dict matching SearchOutcome fields.
 
     best_move / ranked / pv use (from_sq, to_sq) tuples or None.
@@ -79,6 +79,8 @@ def search_cells(cells, int turn, double time_limit=4.0, int max_depth=8,
         buf[i] = cells[i]
     board_init_from_cells(&root, buf, turn)
     searcher_init(&s, &root, time_limit, max_depth)
+    if cancel_gen >= 0:
+        s.cancel_gen = cancel_gen
 
     have_best = 0
     best_depth = 0
@@ -93,15 +95,19 @@ def search_cells(cells, int turn, double time_limit=4.0, int max_depth=8,
         if last_duration and (now_sec() - s.start) + last_duration * 3.0 > s.time_limit:
             break
         t0 = now_sec()
+        if s.cancel_gen != SEARCH_GEN:
+            s.aborted = True
+            break
         s.aborted = False
         if depth >= 3 and have_best:
             alpha = best_score - ASPIRATION
             beta = best_score + ASPIRATION
             delta = ASPIRATION
             while True:
-                ok = root_search(&s, depth, alpha, beta,
-                                 &bm_frm, &bm_to, &bm_score,
-                                 rfrms, rtos, rscores, rexact, &rn)
+                with nogil:
+                    ok = root_search(&s, depth, alpha, beta,
+                                     &bm_frm, &bm_to, &bm_score,
+                                     rfrms, rtos, rscores, rexact, &rn)
                 if s.aborted or not ok or bm_frm < 0:
                     break
                 if bm_score <= alpha:
@@ -118,9 +124,10 @@ def search_cells(cells, int turn, double time_limit=4.0, int max_depth=8,
                     continue
                 break
         else:
-            ok = root_search(&s, depth, -INF_SCORE, INF_SCORE,
-                             &bm_frm, &bm_to, &bm_score,
-                             rfrms, rtos, rscores, rexact, &rn)
+            with nogil:
+                ok = root_search(&s, depth, -INF_SCORE, INF_SCORE,
+                                 &bm_frm, &bm_to, &bm_score,
+                                 rfrms, rtos, rscores, rexact, &rn)
         last_duration = now_sec() - t0
         if s.aborted:
             break
@@ -135,6 +142,7 @@ def search_cells(cells, int turn, double time_limit=4.0, int max_depth=8,
                 "ranked": [],
                 "pv": [],
                 "alt_depth": 0,
+                "threads": s.root_threads,
             }
         have_best = 1
         best_depth = depth
@@ -167,6 +175,7 @@ def search_cells(cells, int turn, double time_limit=4.0, int max_depth=8,
             "ranked": ranked_list,
             "pv": pv_list,
             "alt_depth": 0,
+            "threads": s.root_threads,
         }
 
     # sort results by score desc for ranked seed
@@ -219,6 +228,9 @@ def search_cells(cells, int turn, double time_limit=4.0, int max_depth=8,
                 ranked_list = [(mv, sc, True)] + [r for r in ranked_list if r[0] != mv]
                 break
 
+    # 已被新一轮打断时不再续搜主变，尽快把锁让给新线程
+    if s.cancel_gen != SEARCH_GEN:
+        fill_pv = False
     # restore searcher board to root for PV
     board_clone(&s.board, &root)
     pv_len = extract_pv(&s, best_frm, best_to, best_depth, fill_pv, pv_frms, pv_tos)
@@ -233,4 +245,16 @@ def search_cells(cells, int turn, double time_limit=4.0, int max_depth=8,
         "ranked": ranked_list,
         "pv": pv_list,
         "alt_depth": alt_depth,
+        "threads": s.root_threads,
     }
+
+
+def bump_search_gen():
+    """作废正在跑的搜索。新搜索应记下返回值，世代不符就立刻退出。"""
+    global SEARCH_GEN
+    SEARCH_GEN += 1
+    return SEARCH_GEN
+
+
+def current_search_gen():
+    return SEARCH_GEN

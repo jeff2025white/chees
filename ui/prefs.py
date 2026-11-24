@@ -8,7 +8,7 @@ import os
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PREFS_PATH = os.path.join(_HERE, "user_prefs.json")
 
-_DEFAULT_DEPTH = 8
+_DEFAULT_DEPTH = 9
 _DEPTH_MIN = 2
 _DEPTH_MAX = 12
 
@@ -95,3 +95,16 @@ def get_turn_detect_enabled(default: bool = True) -> bool:
 def set_turn_detect_enabled(on: bool) -> None:
     """保存行棋方判定开关。"""
     save_prefs(turn_detect_enabled=bool(on))
+
+
+def get_fx_detect_enabled(default: bool = False) -> bool:
+    """是否在自动监听里检测墨迹动画并跳过该帧。默认关闭。"""
+    data = load_prefs()
+    if "fx_detect_enabled" in data:
+        return bool(data["fx_detect_enabled"])
+    return bool(default)
+
+
+def set_fx_detect_enabled(on: bool) -> None:
+    """保存墨迹动画检测开关。"""
+    save_prefs(fx_detect_enabled=bool(on))

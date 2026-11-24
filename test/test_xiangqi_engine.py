@@ -322,6 +322,33 @@ class TestOpeningAntiPawnGrab(unittest.TestCase):
         # 贪打兵不应凭子力压过出车
         self.assertLessEqual(evaluate(raid) - evaluate(develop), 20)
 
+    def test_opening_pawn_capture_below_full_value(self):
+        """开局吃未过河卒，静态收益应低于满子力 100。"""
+        board = Board.from_fen(START_FEN)
+        board.cells[6 * 9] = 0  # 让出边兵，边车可直吃对方边卒
+        board.piece_count -= 1
+        from engine.evaluate import compute_base_score
+        board.base_score = compute_base_score(board.cells)
+        self.assertTrue(board.is_opening())
+        before = evaluate(board)
+        taken = board.clone()
+        taken.apply((9 * 9, 3 * 9))
+        self.assertLess(evaluate(taken) - before, 80)
+
+    def test_endgame_pawn_capture_also_reduced(self):
+        """残局吃未过河兵也不按满值 100 计。"""
+        cells = [0] * 90
+        cells[4] = (BLACK << 3) | 1
+        cells[85] = 1
+        cells[3 * 9] = (BLACK << 3) | 7
+        cells[9 * 9] = 5
+        board = Board(cells, RED)
+        self.assertFalse(board.is_opening())
+        before = evaluate(board)
+        taken = board.clone()
+        taken.apply((9 * 9, 3 * 9))
+        self.assertLess(evaluate(taken) - before, 80)
+
     def test_rook_lateral_develop_beats_sitting(self):
         """车一平二虽仍在底线，也应比窝在原位更好。"""
         from engine.book import iccs_to_move
