@@ -975,7 +975,12 @@ class ChessApp:
                         self.root.after(0, lambda lv=level: self._set_work(
                             "wait", f"监听中 · 特效（{lv}）",
                         ))
-                    self._log_listen(flow, f"跳过 · 特效 · {self._fx_log_detail(fx, fw, fh)}", warn=True)
+                        self._log_listen(
+                            flow,
+                            f"跳过 · 特效 · {self._fx_log_detail(fx, fw, fh)}",
+                            warn=True,
+                            brief=True,
+                        )
                     self._auto_stop.wait(interval)
                     continue
 
@@ -1012,7 +1017,7 @@ class ChessApp:
                 if self._auto_skip_reason != "no_board":
                     self._auto_skip_reason = "no_board"
                     self.root.after(0, lambda: self._set_work("wait", "监听中 · 无棋盘"))
-                self._log_listen(flow, f"跳过 · 无棋盘 · {detail}", warn=True)
+                    self._log_listen(flow, f"跳过 · 无棋盘 · {detail}", warn=True, brief=True)
                 # 离开棋盘页时刷新原图
                 self.root.after(0, lambda p=pil_img: self._auto_show_raw(p))
                 self._last_grid_str = None
@@ -1048,10 +1053,11 @@ class ChessApp:
                     self._auto_skip_reason = reason
                     waiting = "监听中 · 计算中" if self._computing.is_set() else "监听中 · 等待局面"
                     self.root.after(0, lambda w=waiting: self._set_work("wait", w))
-                self._log_listen(
-                    flow,
-                    f"跳过 · 局面未变 · 帧{fw}x{fh} · 红{r_cnt}/黑{b_cnt} · {side_txt}",
-                )
+                    self._log_listen(
+                        flow,
+                        f"跳过 · 局面未变 · 红{r_cnt}/黑{b_cnt} · {side_txt}",
+                        brief=True,
+                    )
                 self._auto_stop.wait(interval)
                 continue
 
@@ -1106,11 +1112,12 @@ class ChessApp:
                 if reason != self._auto_skip_reason:
                     self._auto_skip_reason = reason
                     self.root.after(0, lambda: self._set_work("wait", "监听中 · 对方行棋"))
-                self._log_listen(
-                    flow,
-                    f"跳过 · 对方行棋 · {change_txt} · 帧{fw}x{fh} · {side_txt}",
-                    warn=True,
-                )
+                    self._log_listen(
+                        flow,
+                        f"跳过 · 对方行棋 · {change_txt} · {side_txt}",
+                        warn=True,
+                        brief=True,
+                    )
                 self._auto_stop.wait(interval)
                 continue
 
@@ -1223,9 +1230,12 @@ class ChessApp:
             if seq == self._calc_seq:
                 self._computing.clear()
 
-    def _log_listen(self, flow, action, *, warn=False):
-        """监听帧一行：各段耗时 + 本帧结论。"""
-        line = f"{flow.one_line()} · {action}"
+    def _log_listen(self, flow, action, *, warn=False, brief=False):
+        """监听帧一行。brief 只留结论和总耗时，重复等待态用它。"""
+        if brief:
+            line = f"{action} · {_fmt_ms(flow.total_ms())}"
+        else:
+            line = f"{flow.one_line()} · {action}"
         self.root.after(0, lambda s=line, w=warn: self._log_step(s, warn=w))
 
     def _auto_show_raw(self, pil_img):
