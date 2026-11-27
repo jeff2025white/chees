@@ -32,6 +32,8 @@ cdef enum:
     INF_SCORE = 10000000
     MAX_PLY = 64
     ASPIRATION = 60
+    PERP_CHECK = 30000
+    PERP_SLACK = 512
     TT_SIZE = 1 << 20
     TT_MASK = (1 << 20) - 1
     TT_EXACT = 0
@@ -131,6 +133,57 @@ cdef inline bint tt_probe(unsigned long long key, int* depth, int* score, int* f
     return hit
 
 
+cdef inline int perp_magnitude(int ply) noexcept nogil:
+    if ply < 0:
+        ply = 0
+    if ply > PERP_SLACK:
+        ply = PERP_SLACK
+    return PERP_CHECK - ply
+
+
+cdef inline bint is_perp_score(int score) noexcept nogil:
+    cdef int mag = score if score >= 0 else -score
+    return mag >= PERP_CHECK - PERP_SLACK and mag <= PERP_CHECK
+
+
+cdef int cycle_score(CBoard* b, int ply) noexcept nogil:
+    """最近一圈只有一方步步将军时，从行棋方视角给出大负分；否则 0。"""
+    cdef unsigned long long h = board_hash(b)
+    cdef int n = b.hash_len - 1
+    cdef int k = -1
+    cdef int i, span
+    cdef bint us_all, them_all, gave
+    cdef int mag
+    if b.undo_len != n:
+        return 0
+    for i in range(n - 1, -1, -1):
+        if b.hash_stack[i] == h:
+            k = i
+            break
+    if k < 0:
+        return 0
+    span = n - k
+    if span < 2 or (span & 1) != 0:
+        return 0
+    us_all = True
+    them_all = True
+    for i in range(span):
+        if b.undo_stack[k + i].is_null:
+            return 0
+        gave = b.undo_stack[k + i].gave_check != 0
+        if (i & 1) == 0:
+            if not gave:
+                us_all = False
+        elif not gave:
+            them_all = False
+    if us_all == them_all:
+        return 0
+    mag = perp_magnitude(ply)
+    if us_all:
+        return -mag
+    return mag
+
+
 cdef inline void tt_store(unsigned long long key, int depth, int score, int flag,
                           int frm, int to) noexcept nogil:
     cdef int i = <int>(key & TT_MASK)
@@ -213,6 +266,9 @@ cdef int quiesce(Searcher* s, int alpha, int beta, int ply, int qdepth) noexcept
         stand = -stand
 
     checked = in_check(&s.board, s.board.turn)
+    board_stamp_check(&s.board, checked)
+    if ply > 0 and board_is_repetition(&s.board):
+        return cycle_score(&s.board, ply)
     if checked:
         qcap = s.max_depth + 4
     else:
@@ -253,6 +309,8 @@ cdef int negamax(Searcher* s, int depth, int alpha, int beta, int ply, bint allo
     cdef unsigned long long key
     cdef bint checked
     cdef int R, alpha_orig, n, i, is_capture, reduction, score, best, best_frm, best_to, flag
+    cdef int stand, margin, quiet_n, lmp_limit
+    cdef bint futile, is_tt, gives_check
     cdef int frms[MAX_MOVES], tos[MAX_MOVES]
 
     s.nodes += 1
@@ -261,7 +319,8 @@ cdef int negamax(Searcher* s, int depth, int alpha, int beta, int ply, bint allo
         return 0
 
     if ply > 0 and board_is_repetition(&s.board):
-        return 0
+        board_stamp_check(&s.board, in_check(&s.board, s.board.turn))
+        return cycle_score(&s.board, ply)
 
     if depth <= 0:
         return quiesce(s, alpha, beta, ply, 0)
@@ -281,6 +340,26 @@ cdef int negamax(Searcher* s, int depth, int alpha, int beta, int ply, bint allo
                 return key_score
 
     checked = in_check(&s.board, s.board.turn)
+    board_stamp_check(&s.board, checked)
+
+    # 根以下才剪。吃子、将军、置换表着法不剪。
+    futile = False
+    if ply > 0 and not checked and depth <= 4 and beta < MATE_SCORE - 1000:
+        stand = evaluate_board(&s.board)
+        if s.board.turn == BLACK:
+            stand = -stand
+        if depth == 1:
+            margin = 300
+        elif depth == 2:
+            margin = 550
+        elif depth == 3:
+            margin = 900
+        else:
+            margin = 1400
+        if stand - margin >= beta:
+            return beta
+        if depth <= 2 and stand + margin <= alpha:
+            futile = True
 
     if (allow_null and depth >= 3 and ply > 0 and not checked
             and beta < INF_SCORE // 2 and alpha > -INF_SCORE // 2):
@@ -290,7 +369,7 @@ cdef int negamax(Searcher* s, int depth, int alpha, int beta, int ply, bint allo
         board_undo(&s.board)
         if s.aborted:
             return 0
-        if score >= beta:
+        if score >= beta and not is_perp_score(score):
             return score
 
     alpha_orig = alpha
@@ -302,8 +381,26 @@ cdef int negamax(Searcher* s, int depth, int alpha, int beta, int ply, bint allo
     best = -INF_SCORE
     best_frm = -1
     best_to = -1
+    quiet_n = 0
+    if depth == 1:
+        lmp_limit = 8
+    elif depth == 2:
+        lmp_limit = 12
+    elif depth == 3:
+        lmp_limit = 18
+    else:
+        lmp_limit = 0
     for i in range(n):
         is_capture = 1 if s.board.cells[tos[i]] else 0
+        is_tt = tt_frm >= 0 and frms[i] == tt_frm and tos[i] == tt_to
+        if ply > 0 and not checked and not is_capture and not is_tt:
+            quiet_n += 1
+            if futile or (depth <= 3 and quiet_n > lmp_limit):
+                board_apply(&s.board, frms[i], tos[i])
+                gives_check = in_check(&s.board, s.board.turn)
+                board_undo(&s.board)
+                if not gives_check:
+                    continue
         reduction = 0
         if (depth >= 3 and i >= 4 and not is_capture and not checked
                 and not (frms[i] == tt_frm and tos[i] == tt_to)):
@@ -344,7 +441,8 @@ cdef int negamax(Searcher* s, int depth, int alpha, int beta, int ply, bint allo
         flag = TT_LOWER
     else:
         flag = TT_EXACT
-    tt_store(key, depth, best, flag, best_frm, best_to)
+    if not is_perp_score(best):
+        tt_store(key, depth, best, flag, best_frm, best_to)
     return best
 
 

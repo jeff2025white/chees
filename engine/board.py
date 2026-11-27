@@ -50,17 +50,20 @@ class Board:
     cells 为长度 90 的一维数组；turn 表示轮到哪一方走（RED / BLACK）。
     undo_stack 保存 (move, captured, hash_before) 供撤销；
     hash_stack 保存每一步之后的 Zobrist 哈希，用于重复局面判断。
+    gave_check / null_move 与走子一一对应：这一步是否将军、是否空着。
     piece_count / base_score（子力+PST）随走子增量维护，供评估加速。
     """
 
     __slots__ = ("cells", "turn", "undo_stack", "hash_stack", "kings",
-                 "piece_count", "base_score")
+                 "piece_count", "base_score", "gave_check", "null_move")
 
     def __init__(self, cells=None, turn: int = RED):
         self.cells = list(cells) if cells is not None else [EMPTY] * SQUARES
         self.turn = turn
         self.undo_stack = []
         self.hash_stack = [self._compute_hash()]
+        self.gave_check = []
+        self.null_move = []
         # 缓存双方将/帅位置，搜索中 O(1) 取用；-1 表示不在棋盘上
         self.kings = [-1, -1]
         self.piece_count = 0
@@ -125,6 +128,8 @@ class Board:
         self.turn = BLACK if self.turn == RED else RED
         self.undo_stack.append((move, captured, h))
         self.hash_stack.append(h)
+        self.gave_check.append(False)
+        self.null_move.append(False)
         return captured
 
     def apply_null(self) -> None:
@@ -133,11 +138,21 @@ class Board:
         self.turn = BLACK if self.turn == RED else RED
         self.undo_stack.append((None, 0, h))
         self.hash_stack.append(h)
+        self.gave_check.append(False)
+        self.null_move.append(True)
+
+    def stamp_check(self, gave: bool) -> None:
+        """把刚走的这一步标成是否将军。空着不算将军。"""
+        if not self.null_move or self.null_move[-1]:
+            return
+        self.gave_check[-1] = bool(gave)
 
     def undo(self) -> None:
         """撤销最近一步（含空着）。"""
         move, captured, _ = self.undo_stack.pop()
         self.hash_stack.pop()
+        self.gave_check.pop()
+        self.null_move.pop()
         if move is None:
             self.turn = BLACK if self.turn == RED else RED
             return
@@ -157,7 +172,7 @@ class Board:
 
     # -- 重复局面 ---------------------------------------------------------
     def is_repetition(self) -> bool:
-        """当前哈希是否在历史中出现过（用于搜索中的和棋剪枝）。"""
+        """当前哈希是否在历史中出现过。长将与和棋的区分在搜索里做。"""
         h = self.hash_stack[-1]
         n = len(self.hash_stack) - 1
         for i in range(n):

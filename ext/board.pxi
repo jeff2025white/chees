@@ -23,6 +23,7 @@ cdef struct UndoEntry:
     int to
     int captured
     int is_null
+    int gave_check
     unsigned long long hash_after
 
 
@@ -103,6 +104,7 @@ cdef inline int board_apply(CBoard* b, int frm, int to) noexcept nogil:
     b.undo_stack[b.undo_len].to = to
     b.undo_stack[b.undo_len].captured = captured
     b.undo_stack[b.undo_len].is_null = 0
+    b.undo_stack[b.undo_len].gave_check = 0
     b.undo_stack[b.undo_len].hash_after = h
     b.undo_len += 1
     b.hash_stack[b.hash_len] = h
@@ -117,6 +119,7 @@ cdef inline void board_apply_null(CBoard* b) noexcept nogil:
     b.undo_stack[b.undo_len].to = -1
     b.undo_stack[b.undo_len].captured = 0
     b.undo_stack[b.undo_len].is_null = 1
+    b.undo_stack[b.undo_len].gave_check = 0
     b.undo_stack[b.undo_len].hash_after = h
     b.undo_len += 1
     b.hash_stack[b.hash_len] = h
@@ -146,6 +149,17 @@ cdef inline void board_undo(CBoard* b) noexcept nogil:
     if (piece & 7) == KING:
         b.kings[piece >> 3] = frm
     b.turn = 1 - b.turn
+
+
+cdef inline void board_stamp_check(CBoard* b, bint gave) noexcept nogil:
+    """刚走的这一步是否将军。空着保持 0。"""
+    cdef UndoEntry* u
+    if b.undo_len <= 0:
+        return
+    u = &b.undo_stack[b.undo_len - 1]
+    if u.is_null:
+        return
+    u.gave_check = 1 if gave else 0
 
 
 cdef inline bint board_is_repetition(CBoard* b) noexcept nogil:

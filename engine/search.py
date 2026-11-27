@@ -17,10 +17,70 @@ MATE = 100000
 INF = 10 ** 7
 MAX_PLY = 64
 ASPIRATION = 60
+# 长将：比任何子力损失都重，又轻于真正的将死。按步数略减，避免和杀棋分混在一起。
+PERP_CHECK = 30000
+PERP_SLACK = 512
 
 TT_EXACT = 0
 TT_LOWER = 1
 TT_UPPER = 2
+
+# 无效剪枝余量（厘兵），下标为深度。兵 100、马 400、车 1200。
+_FUTILITY_MARGIN = (0, 300, 550, 900, 1400)
+# 浅层每节点至少先搜这么多手安静着，再跳过后面的。
+_LMP_QUIET = (0, 8, 12, 18)
+
+
+def perp_magnitude(ply: int) -> int:
+    """长将分的绝对值。越早被判，分越重，但仍落在杀棋分以下。"""
+    if ply < 0:
+        ply = 0
+    if ply > PERP_SLACK:
+        ply = PERP_SLACK
+    return PERP_CHECK - ply
+
+
+def is_perp_score(score: int) -> bool:
+    """分数是否来自长将（与路径有关，不能写入置换表）。"""
+    mag = abs(score)
+    return PERP_CHECK - PERP_SLACK <= mag <= PERP_CHECK
+
+
+def cycle_score(board, ply: int) -> int:
+    """局面已经重复时，从行棋方视角给出分数。
+
+    最近这一圈里只有一方步步将军：该方大负分。
+    双方都是、或有一步不是将军、或圈里夹着空着：和棋 0。
+    """
+    n = len(board.hash_stack) - 1
+    if len(board.gave_check) != n or len(board.null_move) != n:
+        return 0
+    h = board.hash_stack[-1]
+    k = -1
+    for i in range(n - 1, -1, -1):
+        if board.hash_stack[i] == h:
+            k = i
+            break
+    if k < 0:
+        return 0
+    span = n - k
+    if span < 2 or span % 2:
+        return 0
+    us_all = True
+    them_all = True
+    for i in range(span):
+        if board.null_move[k + i]:
+            return 0
+        gave = board.gave_check[k + i]
+        if i % 2 == 0:
+            if not gave:
+                us_all = False
+        elif not gave:
+            them_all = False
+    if us_all == them_all:
+        return 0
+    mag = perp_magnitude(ply)
+    return -mag if us_all else mag
 
 # 定长置换表（模块级共享，避免每次搜索分配）：2^20 槽，depth-prefer
 TT_SIZE = 1 << 20
@@ -223,6 +283,9 @@ class Searcher:
             stand = -stand
 
         checked = in_check(board, turn)
+        board.stamp_check(checked)
+        if ply > 0 and board.is_repetition():
+            return cycle_score(board, ply)
         if checked:
             qcap = self.max_depth + 4
         else:
@@ -265,7 +328,8 @@ class Searcher:
         board = self.board
 
         if ply > 0 and board.is_repetition():
-            return 0
+            board.stamp_check(in_check(board, board.turn))
+            return cycle_score(board, ply)
 
         if depth <= 0:
             return self.quiesce(alpha, beta, ply, 0)
@@ -287,6 +351,22 @@ class Searcher:
                     return e_score
 
         checked = in_check(board, board.turn)
+        board.stamp_check(checked)
+
+        # 根以下才剪。吃子、将军、置换表着法不剪。
+        # 反向无效：静态分已经高出 beta 一个子力档，直接判高。
+        # 无效：静态分低过 alpha 一个子力档时，跳过安静着。
+        # 后期：浅层里排在后面的安静着不再展开。
+        futile = False
+        if ply > 0 and not checked and depth <= 4 and beta < MATE - 1000:
+            stand = evaluate(board)
+            if board.turn == BLACK:
+                stand = -stand
+            margin = _FUTILITY_MARGIN[depth]
+            if stand - margin >= beta:
+                return beta
+            if depth <= 2 and stand + margin <= alpha:
+                futile = True
 
         if (allow_null and depth >= 3 and ply > 0 and not checked
                 and beta < INF // 2 and alpha > -INF // 2):
@@ -297,7 +377,7 @@ class Searcher:
                                       allow_null=False)
             finally:
                 board.undo()
-            if score >= beta:
+            if score >= beta and not is_perp_score(score):
                 return score
 
         alpha_orig = alpha
@@ -308,8 +388,20 @@ class Searcher:
         moves = self._order_moves(moves, ply, tt_move)
         best = -INF
         best_move = None
+        quiet_n = 0
+        lmp_limit = _LMP_QUIET[depth] if depth <= 3 else 0
         for i, mv in enumerate(moves):
             is_capture = bool(board.cells[mv[1]])
+            if ply > 0 and not checked and not is_capture and mv != tt_move:
+                quiet_n += 1
+                if futile or (depth <= 3 and quiet_n > lmp_limit):
+                    board.apply(mv)
+                    try:
+                        gives_check = in_check(board, board.turn)
+                    finally:
+                        board.undo()
+                    if not gives_check:
+                        continue
             reduction = 0
             if (depth >= 3 and i >= 4 and not is_capture and not checked
                     and mv != tt_move):
@@ -347,7 +439,9 @@ class Searcher:
             flag = TT_LOWER
         else:
             flag = TT_EXACT
-        self._tt_store(key, depth, best, flag, best_move)
+        # 长将分依赖这条着法栈，不能留给别的路径复用。
+        if not is_perp_score(best):
+            self._tt_store(key, depth, best, flag, best_move)
         return best
 
     # -- 根节点 -----------------------------------------------------------

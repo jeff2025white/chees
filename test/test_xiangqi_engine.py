@@ -17,9 +17,9 @@ from engine.book import book_entries, book_lines, iccs_to_move, lookup_book
 from engine.constants import BLACK, CHARIOT, HORSE, PIECE_VALUE, RED, START_FEN
 from engine.decide import endgame_search_budget, parse_side
 from engine.evaluate import evaluate, see_value
-from engine.movegen import game_status, generate_legal, generate_legal_moves, perft
+from engine.movegen import game_status, generate_legal, generate_legal_moves, in_check, perft
 from engine.notation import chinese_notation, move_to_iccs
-from engine.search import MATE, search
+from engine.search import MATE, PERP_CHECK, cycle_score, search, search_python
 from engine.verdict import build_verdict, score_for_our_side
 
 MATE_IN_ONE_FEN = "3ak4/8R/5a3/3N5/9/9/9/9/9/3K5 w - - 0 1"
@@ -471,6 +471,66 @@ class TestPvAntiOscillation(unittest.TestCase):
         for mv in pv:
             replay.apply(mv)
             self.assertFalse(replay.is_repetition(), f"PV 含重复局面: {pv}")
+
+
+def _push(board, move):
+    board.apply(move)
+    board.stamp_check(in_check(board, board.turn))
+
+
+# 车在底线一侧来回将军，对方将只有一格可挪。红方再将军就会走回原局面。
+PERP_FEN = "4ka3/9/9/9/9/9/3R5/9/9/5K3 w - - 0 1"
+
+
+class TestPerpetualCheck(unittest.TestCase):
+    def test_cycle_score_penalizes_only_the_checker(self):
+        """车将军、将挪、车退回再将军、将退回：长将方大负。有一步不将军则仍是和棋。"""
+        board = Board.from_fen(PERP_FEN)
+        check = (sq(6, 3), sq(6, 4))
+        king_aside = (sq(0, 4), sq(0, 3))
+        check_back = (sq(6, 4), sq(6, 3))
+        king_back = (sq(0, 3), sq(0, 4))
+        self.assertIn(check, generate_legal(board))
+        _push(board, check)
+        self.assertIn(king_aside, generate_legal(board))
+        _push(board, king_aside)
+        self.assertIn(check_back, generate_legal(board))
+        _push(board, check_back)
+        self.assertIn(king_back, generate_legal(board))
+        _push(board, king_back)
+        self.assertTrue(board.is_repetition())
+        score = cycle_score(board, 4)
+        self.assertLess(score, -(PERP_CHECK - 1000))
+        self.assertGreater(score, -(PERP_CHECK + 1))
+
+        # 一将一闲：我方第二步不算将军，循环改为和棋。
+        board.gave_check[2] = False
+        self.assertEqual(cycle_score(board, 4), 0)
+        # 双方都在步步将军，不变作和。
+        for i in range(4):
+            board.gave_check[i] = True
+        self.assertEqual(cycle_score(board, 4), 0)
+        # 圈里夹着空着，不当长将。
+        board.null_move[1] = True
+        self.assertEqual(cycle_score(board, 4), 0)
+
+    def test_search_does_not_recheck_the_shuttle(self):
+        """将已经挪开后，车退回再将军会把局面走回，搜索应改选别的着。"""
+        board = Board.from_fen(PERP_FEN)
+        _push(board, (sq(6, 3), sq(6, 4)))
+        _push(board, (sq(0, 4), sq(0, 3)))
+        recheck = (sq(6, 4), sq(6, 3))
+        for found in (
+            search_python(board, time_limit=2.0, max_depth=4, top_n=0, fill_pv=False),
+            search(board, time_limit=2.0, max_depth=4, top_n=0, fill_pv=False),
+        ):
+            self.assertNotEqual(found.best_move, recheck)
+            self.assertGreater(found.score, -PERP_CHECK // 2)
+            replay = board.clone()
+            for mv in found.pv:
+                self.assertNotEqual(mv, recheck)
+                replay.apply(mv)
+                self.assertFalse(replay.is_repetition(), f"推演走回长将循环: {found.pv}")
 
 
 if __name__ == "__main__":
